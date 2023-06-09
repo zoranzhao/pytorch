@@ -6,6 +6,8 @@ import itertools
 import logging
 import math
 import operator
+import pickle, os
+from ..utils import get_dtype_size
 from typing import Dict, Iterable, List, Set
 
 import sympy
@@ -20,7 +22,13 @@ from .. import config, ir, scheduler
 from ..codecache import code_hash, get_path
 from ..ir import ReductionHint
 from ..optimize_indexing import indexing_dtype_strength_reduction
-from ..triton_heuristics import AutotuneHint
+from ..triton_heuristics import (
+    AutotuneHint,
+    pointwise_heuristic,
+    reduction_heuristic,
+    persistent_reduction_heuristic,
+)
+from ..dependencies import StarDep, WeakDep
 from ..utils import (
     DeferredLineBase,
     get_fused_kernel_name,
@@ -1590,14 +1598,18 @@ class TritonKernel(Kernel):
 
         return result
 
-    def codegen_kernel(self, name=None):
+    def codegen_kernel(
+        self, name=None, get_autotuner_dict=False, inject_autotuner_config=None
+    ):
         from triton import next_power_of_2
 
         code = IndentedBuffer()
+        autotuner_dict = dict()
 
         size_hints = [
             next_power_of_2(V.graph.sizevars.size_hint(numel)) for numel in self.numels
         ]
+
         if self.persistent_reduction:
             assert self.inside_reduction
             heuristics = "persistent_reduction"
@@ -1674,6 +1686,8 @@ class TritonKernel(Kernel):
                 # )
                 # argdefs.append(f"{tree.prefix}numel: tl.constexpr")
         triton_meta["configs"] = [config_of(signature)]
+        if inject_autotuner_config is not None:
+            triton_meta["autotuner_configs"] = inject_autotuner_config
 
         for tree in self.range_trees:
             if tree.prefix == "r" and (
@@ -1695,6 +1709,10 @@ class TritonKernel(Kernel):
                 )
                 @triton.jit
             """
+            autotuner_dict["size_hints"] = size_hints
+            autotuner_dict["reduction_hint"] = reduction_hint
+            autotuner_dict["meta"] = triton_meta
+            autotuner_dict["heuristics"] = heuristics
         else:
             tile_hint = ""
             if len(size_hints) == 2:
@@ -1706,6 +1724,11 @@ class TritonKernel(Kernel):
                 @{heuristics}(size_hints={size_hints!r}, {tile_hint}filename=__file__, meta={triton_meta!r})
                 @triton.jit
             """
+            autotuner_dict["size_hints"] = size_hints
+            autotuner_dict["tile_hint"] = tile_hint
+            autotuner_dict["meta"] = triton_meta
+            autotuner_dict["heuristics"] = heuristics
+
         code.splice(heuristics_line)
         code.writeline(f"def {name or 'KERNEL_NAME'}({', '.join(argdefs)}):")
         self.codegen_body()
@@ -1721,6 +1744,8 @@ class TritonKernel(Kernel):
         if name is not None:
             return code.getvalue()
 
+        if get_autotuner_dict:
+            return code.getvalue(), autotuner_dict
         return code.getvalue()
 
     def codegen_static_numels(self, code):
@@ -1877,6 +1902,516 @@ class TritonKernel(Kernel):
 
     def create_cse_var(self, *args, **kwargs):
         return TritonCSEVariable(*args, **kwargs)
+
+
+#################### Extract feature vector ####################
+import time, copy, os, xgboost, numpy as np
+
+# op_dict needs to be deterministic
+op_dict = {
+    "load": 0,
+    "to_dtype": 1,
+    "add": 2,
+    "reduction": 3,
+    "constant": 4,
+    "div": 5,
+    "store": 6,
+    "sub": 7,
+    "square": 8,
+    "rsqrt": 9,
+    "mul": 10,
+    "tanh": 11,
+    "ne": 12,
+    "where": 13,
+    "indirect_indexing": 14,
+    "log": 15,
+    "neg": 16,
+    "exp": 17,
+    "maximum": 18,
+    "minimum": 19,
+    "index_expr": 20,
+    "ge": 21,
+    "masked": 22,
+    "lt": 23,
+    "and_": 24,
+    "erf": 25,
+    "eq": 26,
+    "le": 27,
+    "gt": 28,
+    "relu": 29,
+    "sqrt": 30,
+    "logical_not": 31,
+    "load_seed": 32,
+    "rand": 33,
+    "abs": 34,
+    "reciprocal": 35,
+    "ceil": 36,
+    "sigmoid": 37,
+    "sin": 38,
+    "cos": 39,
+    "logical_and": 40,
+    "bitwise_and": 41,
+    "randn": 42,
+    "floor": 43,
+    "remainder": 44,
+    "isinf": 45,
+    "logical_or": 46,
+    "expm1": 47,
+    "libdevice_sqrt": 48,
+    "libdevice_log": 49,
+    "truediv": 50,
+    "sign": 51,
+    "randint64": 52,
+    "bitwise_or": 53,
+    "pow": 54,
+    "isnan": 55,
+}
+
+
+class KernelCategory:
+    POINTWISE = 0
+    REDUCTION = 1
+    PERSISTENT_REDUCTION = 2
+
+
+def get_kernel_category(category: str) -> KernelCategory:
+    return {
+        "pointwise": KernelCategory.POINTWISE,
+        "reduction": KernelCategory.REDUCTION,
+        "persistent_reduction": KernelCategory.PERSISTENT_REDUCTION,
+    }[category]
+
+
+def get_number_of_loops(src: str) -> int:
+    return src.count("for roffset in range(0, rnumel, RBLOCK):")
+
+
+def get_tiling(src: str) -> list:
+    names = ["xnumel", "ynumel", "rnumel"]
+    result = list()
+    for name in names:
+        startpos = src.find(name + " =")
+        if startpos == -1:
+            result.append(1)
+            continue
+        endpos = src.find("\n", startpos)
+        result.append(int(src[startpos + len(name + " = ") : endpos]))
+    return result
+
+
+def pad_tensor():
+    tensor_feature = list()
+    tensor_feature.append(False)  # StarDepOrWeakDep
+    tensor_feature.append(0)  # bytes
+    tensor_feature.extend([0] * 6)  # strides
+    tensor_feature.extend([0] * 6)  # size
+    tensor_feature.append(True)  # is_contiguous
+    tensor_feature.append(False)  # is_scalar
+    tensor_feature.append(False)  # is_indirect
+    return tensor_feature
+
+
+def tensor_list(rw_list, rw_len):
+    res = list()
+    rw_list = sorted(rw_list, key=lambda x: x["bytes"], reverse=True)
+    for tensor in rw_list[:rw_len]:
+        tensor_feature = pad_tensor()
+        tensor_feature[0] = tensor["StarDepOrWeakDep"]
+        tensor_feature[1] = tensor["bytes"]
+        # left pad strides
+        for i in range(len(tensor["strides"])):
+            tensor_feature[8 - (len(tensor["strides"]) - i)] = tensor["strides"][i]
+        # left pad size
+        for i in range(len(tensor["size"])):
+            tensor_feature[14 - (len(tensor["size"]) - i)] = tensor["size"][i]
+        tensor_feature[-3] = tensor["is_contiguous"]
+        tensor_feature[-2] = tensor["is_scalar"]
+        tensor_feature[-1] = tensor["is_indirect"]
+        res.append(tensor_feature)
+    for i in range(rw_len - len(rw_list)):
+        res.append(pad_tensor())
+    return res
+
+
+def get_feature_vec(src: str, configs, autotuner_dict):
+    size_hints = autotuner_dict["size_hints"]
+    kernel_category = autotuner_dict["heuristics"]
+    if kernel_category == "reduction":
+        num_of_loops = get_number_of_loops(src)
+    else:
+        num_of_loops = 0
+    (reads, writes, total_bytes) = autotuner_dict["reads_writes"]
+    op_counts = autotuner_dict["node"].read_writes.op_counts
+
+    op_bag = dict()
+    for op in sorted(op_counts.keys()):
+        assert op in op_dict
+        op_bag[op_dict[op]] = op_counts[op]
+    numels = get_tiling(src)
+
+    def f(rw_list):
+        res_list = list()
+        for dep, bytes in rw_list:
+            dep_dict = dict()
+            if isinstance(dep, (StarDep, WeakDep)):
+                dep_dict["StarDepOrWeakDep"] = True
+                continue
+            else:
+                dep_dict["StarDepOrWeakDep"] = False
+            dep_dict["bytes"] = bytes
+            strides = V.graph.sizevars.stride_hints(dep.index, dep.var_names)
+            dep_dict["strides"] = strides
+            dep_dict["size"] = [int(size_) for size_ in dep.size]
+            dep_dict["is_contiguous"] = dep.is_contiguous()
+            dep_dict["is_scalar"] = dep.is_scalar()
+            dep_dict["is_indirect"] = dep.is_indirect()
+            dep_dict["name"] = dep.name
+
+            assert len(dep.size) == len(strides)
+            for size_ in dep.size:
+                assert size_.is_integer
+            for stride in strides:
+                assert isinstance(stride, int)
+            res_list.append(dep_dict)
+        return res_list
+
+    reads = tensor_list(
+        f(sorted(zip(reads, total_bytes[: len(reads)]), key=lambda x: x[0][0])), 10
+    )
+    writes = tensor_list(
+        f(sorted(zip(writes, total_bytes[len(reads) :]), key=lambda x: x[0][0])), 5
+    )
+
+    X = list()
+    for config in configs:
+        feature_vector = list()
+        feature_vector.append(get_kernel_category(kernel_category))
+        feature_vector.append(num_of_loops)
+        op_bag_vec = [0] * len(op_dict)
+        for op in op_bag:
+            op_bag_vec[op] = op_bag[op]
+        feature_vector.extend(op_bag_vec)
+        size_hints_vec = [1] * 2
+        for i in range(len(size_hints)):
+            size_hints_vec[i] = size_hints[i]
+        feature_vector.extend(size_hints_vec)
+
+        for tensor in reads:
+            feature_vector.extend(tensor)
+        for tensor in writes:
+            feature_vector.extend(tensor)
+
+        if "XBLOCK" in config.kwargs:
+            feature_vector.append(config.kwargs["XBLOCK"])
+        else:
+            feature_vector.append(1)
+        if "YBLOCK" in config.kwargs:
+            feature_vector.append(config.kwargs["YBLOCK"])
+        else:
+            feature_vector.append(1)
+        if "RBLOCK" in config.kwargs:
+            feature_vector.append(config.kwargs["RBLOCK"])
+        else:
+            feature_vector.append(1)
+
+        feature_vector.append(config.num_warps)
+        feature_vector.append(config.num_stages)
+        feature_vector.append(numels[0])
+        feature_vector.append(numels[1])
+        feature_vector.append(numels[2])
+
+        X.append(feature_vector)
+
+    return np.array(X)
+
+
+class SearchSpaceGenerator:
+    def __init__(self, size_hints):
+        self.size_hints = size_hints
+
+    def get_xmax(self):
+        xmax = config.triton.max_block["X"]
+        if self.size_hints and len(self.size_hints) > 0:
+            xmax = min(xmax, self.size_hints[0])
+        return xmax
+
+    def get_ymax(self):
+        ymax = config.triton.max_block["Y"]
+        if self.size_hints and len(self.size_hints) > 1:
+            ymax = min(ymax, self.size_hints[1])
+        return ymax
+
+    def get_zmax(self):
+        zmax = config.triton.max_block["Z"]
+        if self.size_hints and len(self.size_hints) > 2:
+            zmax = min(zmax, self.size_hints[2])
+        return zmax
+
+    def get_rmax(self):
+        if self.size_hints and len(self.size_hints) > 0:
+            return self.size_hints[-1]  # the last one is for reduction
+        else:
+            # large enough. We should not pick this large RBLOCK anyway
+            return 2**30
+
+    @property
+    def tunable_fields(self):
+        out = [
+            "XBLOCK",
+            "YBLOCK",
+            "ZBLOCK",
+            # NOTE: we should not tune RBLOCK for persistent reduction.
+            # We rely on the fact that persistent reduction's triton.Config
+            # does not have the RBLOCK field to guarantee that.
+            "RBLOCK",
+            # the following 3 are for mm
+            "BLOCK_M",
+            "BLOCK_N",
+            "BLOCK_K",
+            "num_warps",
+        ]
+        return out
+
+    def value_too_large(self, name, val):
+        if name == "XBLOCK":
+            return val > self.get_xmax()
+        if name == "YBLOCK":
+            return val > self.get_ymax()
+        if name == "ZBLOCK":
+            return val > self.get_zmax()
+        if name == "RBLOCK":
+            return val > self.get_rmax()
+
+        return False
+
+    def get_neighbour_values(self, name, orig_val, radius=1, include_self=False):
+        """
+        Get neighbour values in 'radius' steps. The original value is not
+        returned as it's own neighbour.
+        """
+        assert radius >= 1
+
+        def update(cur_val, inc=True):
+            if name == "num_stages":
+                if inc:
+                    return cur_val + 1
+                else:
+                    return cur_val - 1
+            else:
+                if inc:
+                    return cur_val * 2
+                else:
+                    return cur_val // 2
+
+        out = []
+        # increment loop
+        cur_val = orig_val
+        for _ in range(radius):
+            cur_val = update(cur_val, True)
+            if self.value_too_large(name, cur_val):
+                break
+            out.append(cur_val)
+
+        # decrement loop
+        cur_val = orig_val
+        for _ in range(radius):
+            cur_val = update(cur_val, False)
+            if cur_val <= 0:
+                break
+            out.append(cur_val)
+
+        if include_self:
+            out.append(orig_val)
+        return out
+
+    def get_field(self, config, name):
+        if name == "num_warps":
+            return config.num_warps
+        elif name == "num_stages":
+            return config.num_stages
+        else:
+            return config.kwargs.get(name, None)
+
+    def set_field(self, config, name, value):
+        if name == "num_warps":
+            config.num_warps = value
+        elif name == "num_stages":
+            config.num_stages = value
+        else:
+            config.kwargs[name] = value
+
+    def check_all_tuning_directions(
+        self,
+        best_config,
+    ):
+        """
+        Check all directions. We only do this once the regular coordinate
+        descent tuning find no better choices any more.
+        We only have a few tunable fields, so this should be fine.
+        """
+        candidate_values_list = []
+        effective_fields = []
+        for field in self.tunable_fields:
+            old_value = self.get_field(best_config, field)
+            if old_value is None:
+                continue
+            candidate_values = self.get_neighbour_values(
+                field,
+                old_value,
+                radius=2,
+                include_self=True,
+            )
+            candidate_values_list.append(candidate_values)
+            effective_fields.append(field)
+
+        res = list()
+        choices = itertools.product(*candidate_values_list)
+        for choice in choices:
+            assert len(choice) == len(effective_fields)
+            candidate_config = copy.deepcopy(best_config)
+            for new_val, field in zip(choice, effective_fields):
+                self.set_field(candidate_config, field, new_val)
+            res.append(candidate_config)
+        return res
+
+    def generate(self, best_config):
+        return self.check_all_tuning_directions(best_config)
+
+
+def get_heuristic_configs(autotuner_dict):
+    assert "heuristics" in autotuner_dict
+    assert "meta" in autotuner_dict
+    heuristics = autotuner_dict["heuristics"]
+    size_hints = autotuner_dict["size_hints"]
+    meta = autotuner_dict["meta"]
+    if heuristics == "pointwise":
+        assert "tile_hint" in autotuner_dict
+        return pointwise_heuristic(
+            size_hints=size_hints, meta=meta, tile_hint=autotuner_dict["tile_hint"]
+        )
+    elif heuristics == "reduction":
+        assert "reduction_hint" in autotuner_dict
+        return reduction_heuristic(
+            size_hints=size_hints,
+            reduction_hint=autotuner_dict["reduction_hint"],
+            meta=meta,
+        )
+    elif heuristics == "persistent_reduction":
+        assert "reduction_hint" in autotuner_dict
+        return persistent_reduction_heuristic(
+            size_hints=size_hints,
+            reduction_hint=autotuner_dict["reduction_hint"],
+            meta=meta,
+        )
+    raise ValueError(f"Unknown heuristics {heuristics}")
+
+
+@functools.lru_cache(None)
+def load_model():
+    log.debug(f"loading model, pid {os.getpid()}")
+    ranker = xgboost.XGBRegressor()
+    ranker.load_model(
+        "/scratch/bohanhou/fresh/experiments/xgb_baseline/model_normalize_runtime_all_cpu.bin"
+    )
+    # ranker = xgboost.XGBRanker()
+    # ranker.load_model("/scratch/bohanhou/fresh/experiments/xgb_maxatt/model_cpu.bin")
+    return ranker
+
+
+KERNEL_DICT = dict()
+
+
+def autotuner_predict(autotuner_dict):
+    size_hints = autotuner_dict["size_hints"]
+    src = autotuner_dict["src_code"]
+    configs = autotuner_dict["heuristic_configs"]
+
+    no_X = src.find("XBLOCK: tl.constexpr") != -1
+    no_Y = src.find("YBLOCK: tl.constexpr") != -1
+    no_R = src.find("RBLOCK: tl.constexpr") != -1
+
+    for tconfig in configs:
+        if no_X:
+            tconfig.kwargs.pop("XBLOCK", None)
+        if no_Y:
+            tconfig.kwargs.pop("YBLOCK", None)
+        if no_R:
+            tconfig.kwargs.pop("RBLOCK", None)
+
+    X = get_feature_vec(src, configs, autotuner_dict)
+    ranker = load_model()
+    indices = np.argsort(ranker.predict(X))[::-1]
+    sorted_configs = [configs[i] for i in indices]
+    best_config = sorted_configs[0]
+    candidates = SearchSpaceGenerator(size_hints).generate(best_config)
+    X = get_feature_vec(src, candidates, autotuner_dict)
+    indices = np.argsort(ranker.predict(X))[::-1]
+    sorted_candidates = [candidates[i] for i in indices]
+    # print(
+    #     autotuner_dict["file_name"],
+    #     "\n",
+    #     best_config,
+    #     ">>>",
+    #     [(cfg.kwargs, cfg.num_warps) for cfg in sorted_candidates],
+    # )
+    return sorted_candidates[:2]
+
+    # X = get_feature_vec(src, configs, autotuner_dict)
+    # ranker = load_model()
+    # indices = np.argsort(ranker.predict(X))
+    # sorted_configs = [configs[i] for i in indices]
+    # # if len(sorted_configs) >= 2:
+    # #     return sorted_configs[:2]
+    # # else:
+    # return sorted_configs[:1]
+
+
+def get_reads_writes(cur_scheduler, node):
+    if isinstance(node, scheduler.NopKernelSchedulerNode):
+        return 0
+    reads = {dep.name for dep in node.read_writes.reads}
+    writes = {dep.name for dep in node.read_writes.writes}
+
+    def is_materialized(buf):
+        buf_uses = {user.node for user in cur_scheduler.name_to_node[buf].users}
+        return len(buf_uses - set(node.snodes)) > 0
+
+    if isinstance(node, scheduler.FusedSchedulerNode):
+        removed_buffers = {dep for dep in writes if not is_materialized(dep)}
+        writes = writes - removed_buffers
+        reads = reads - removed_buffers
+
+    dep_removed = list()
+    node_bytes = list()
+
+    def f(rw):
+        for buf in rw:
+            for dep in node.read_writes.reads | node.read_writes.writes:
+                if dep.name == buf:
+                    dep_removed.append(dep)
+
+            if buf in V.graph.name_to_buffer:
+                buf = V.graph.name_to_buffer[buf]
+            elif buf in V.graph.graph_inputs:
+                buf = V.graph.graph_inputs[buf]
+            else:
+                continue
+
+            node_bytes.append(
+                V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
+                * get_dtype_size(buf.get_dtype())
+            )
+
+    f(reads)
+    f(writes)
+    return (
+        dep_removed[: len(reads)],
+        dep_removed[len(reads) :],
+        node_bytes,
+    )
+
+
+############################################################
 
 
 class TritonScheduling:
@@ -2042,7 +2577,7 @@ class TritonScheduling:
         if schedule_log.isEnabledFor(logging.DEBUG):
             schedule_log.debug("Schedule:\n %s", node_schedule)
 
-        return self.codegen_node_schedule(node_schedule, numel, rnumel)
+        return self.codegen_node_schedule(nodes, node_schedule, numel, rnumel)
 
     @staticmethod
     def reduction_hint(node):
@@ -2138,7 +2673,7 @@ class TritonScheduling:
 
         return tiled_groups, reduction_hint_val, mutations, index_dtype
 
-    def codegen_node_schedule(self, node_schedule, numel, reduction_numel):
+    def codegen_node_schedule(self, nodes, node_schedule, numel, reduction_numel):
         tiled_groups, reduction_hint_val, mutations, index_dtype = self.get_kernel_args(
             node_schedule, numel, reduction_numel
         )
@@ -2152,8 +2687,58 @@ class TritonScheduling:
 
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
 
+        ################ autotuner inference
+        # # generate a kernel that does not have autotuner config injected
+        # src_code, autotuner_dict = kernel.codegen_kernel(get_autotuner_dict=True)
+
+        # if src_code in KERNEL_DICT:
+        #     # we have already generated autotuner config for this kernel
+        #     src_code = KERNEL_DICT[src_code]
+        # else:
+        #     # we have not generated autotuner config for this kernel
+        #     src_code_before = src_code
+        #     if len(nodes) == 1:
+        #         node = nodes[0]
+        #     else:
+        #         node = scheduler.FusedSchedulerNode(self.scheduler, nodes)
+        #     autotuner_dict["reads_writes"] = get_reads_writes(self.scheduler, node)
+        #     autotuner_dict["src_code"] = src_code
+        #     autotuner_dict["heuristic_configs"], _ = get_heuristic_configs(
+        #         autotuner_dict
+        #     )
+        #     autotuner_dict["node"] = node
+        #     configs = autotuner_predict(autotuner_dict)
+        #     src_code = kernel.codegen_kernel(
+        #         inject_autotuner_config=[(cfg.kwargs, cfg.num_warps) for cfg in configs]
+        #     )
+        #     KERNEL_DICT[src_code_before] = src_code
+        ################# autotuner inference
+
         src_code = kernel.codegen_kernel()
         kernel_name = self.define_kernel(src_code, node_schedule)
+
+        ################ autotuner training data dump
+        # tuning_metadata_path = self.kernel_path_ + ".pkl"
+        # if not os.path.exists(os.path.dirname(tuning_metadata_path)):
+        #     os.makedirs(os.path.dirname(tuning_metadata_path))
+        # if not os.path.exists(tuning_metadata_path):
+        #     log.warning("Kernel path : " + self.kernel_path_)
+        #     log.warning("Metadata path : " + tuning_metadata_path)
+        #     log.warning(autotuner_dict["reads_writes"])
+        #     log.warning([n.node.__str__() for n in nodes])
+        #     log.warning(node.read_writes)
+        #     log.warning(src_code)
+        #     with open(tuning_metadata_path, "wb") as f:
+        #         pickle.dump(
+        #             [
+        #                 autotuner_dict["reads_writes"],
+        #                 [n.node.__str__() for n in nodes],
+        #                 node.read_writes,
+        #                 src_code,
+        #             ],
+        #             f,
+        #         )
+        ################ autotuning training data dump
 
         kernel.call_kernel(kernel_name)
 
@@ -2228,6 +2813,7 @@ class TritonScheduling:
             src_code = src_code.replace("#pragma CMT", "#")
 
             basename, _, kernel_path = get_path(code_hash(src_code), "py")
+            self.kernel_path_ = kernel_path
 
             compile_wrapper = IndentedBuffer()
             compile_wrapper.writeline(f"async_compile.triton({subs_name!r}, '''")
