@@ -19,7 +19,7 @@ import torch.utils._pytree as pytree
 from torch._dynamo import logging as dynamo_logging, utils as dynamo_utils
 from torch._dynamo.utils import detect_fake_mode
 from torch._functorch.aot_autograd import make_boxed_func
-from torch._inductor.codecache import CompiledFxGraph
+from torch._inductor.codecache import CompiledFxGraph, FxGraphCache
 from torch._ops import OpOverload
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
@@ -285,6 +285,8 @@ def compile_fx_inner(
         cudagraphs = config.triton.cudagraphs
 
     # Inputs to fx_codegen_and_compile
+    # Anything that affects codegen should go here, so if the signature
+    # of fx_codegen_and_compile changes, the list and dict should be updated accordingly
     graph_args = [gm, example_inputs]
     graph_kwargs = {
         "cudagraphs": cudagraphs,
@@ -297,10 +299,14 @@ def compile_fx_inner(
         "user_visible_outputs": user_visible_outputs,
         "layout_opt": layout_opt,
     }
-
-    compiled_graph: CompiledFxGraph = fx_codegen_and_compile(
-        *graph_args, **graph_kwargs
-    )
+    if config.fx_graph_cache >= 0:
+        compiled_graph: CompiledFxGraph = FxGraphCache.load(
+            fx_codegen_and_compile, graph_args, graph_kwargs
+        )
+    else:
+        compiled_graph: CompiledFxGraph = fx_codegen_and_compile(
+            *graph_args, **graph_kwargs
+        )
 
     if aot_mode:
         return compiled_graph
