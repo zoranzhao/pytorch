@@ -23,7 +23,7 @@ from torch.utils._mode_utils import no_dispatch
 
 from .._dynamo import config as dynamo_config
 
-from . import config, ir, metrics
+from . import comms, config, ir, metrics
 from .codegen.wrapper import CppWrapperCodeGen, CudaWrapperCodeGen, WrapperCodeGen
 from .exc import (
     LoweringException,
@@ -641,6 +641,12 @@ class GraphLowering(torch.fx.Interpreter):
 
         self.scheduler = Scheduler(self.buffers)
         assert self.scheduler is not None  # mypy can't figure this out
+
+        if config.reordering_for_comms:
+            from .debug import breakpointd
+            self.scheduler.nodes = comms.reorder_computation_for_overlap(self.scheduler.nodes)
+
+        self.scheduler.compute_last_usage()
         self.scheduler.codegen()
         assert self.wrapper_code is not None
         return self.wrapper_code.generate()
@@ -698,11 +704,12 @@ class GraphLowering(torch.fx.Interpreter):
 
         # Logged twice as per https://github.com/pytorch/pytorch/pull/99038#discussion_r1167826029
         # TODO. Revisit this once the logging API is more mature
-        output_code_log.info("Output code written to: %s", mod.__file__)
+        output_code_log.debug("Output code written to: %s", mod.__file__)
         log.debug("Output code written to: %s", mod.__file__)
         output_code_log.debug("Output code: \n%s", code)
         if config.benchmark_kernel:
             print(f"Compiled module path: {mod.__file__}", file=sys.stderr)
+
         V.debug.output_code(mod.__file__)
         V.debug.rename(os.path.splitext(mod.__file__)[0] + ".debug")
         return mod

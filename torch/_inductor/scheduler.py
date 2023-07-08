@@ -13,7 +13,7 @@ import sympy
 import torch
 from torch._dynamo.utils import dynamo_timed
 
-from . import config, dependencies, ir, metrics
+from . import comms, config, dependencies, ir, metrics
 from .dependencies import StarDep, WeakDep
 from .sizevars import SimplifyIndexing
 from .utils import cache_on_self, cmp, free_symbol_has, has_triton
@@ -36,6 +36,10 @@ class OutputNode:
     def __init__(self, dep):
         self.unmet_dependencies = {dep}
         self.inverse_users = []
+
+    @property
+    def node_users(self):
+        return []
 
     def is_reduction(self):
         return False
@@ -223,6 +227,13 @@ class BaseSchedulerNode:
 
     def can_inplace(self, read_dep: dependencies.MemoryDep):
         return False
+
+    @property
+    def node_users(self):
+        # if self.users is None:
+        #     from .debug import breakpointd
+            # breakpointd()
+        return [x.node for x in self.users]
 
     def allocate(self):
         if not self.node.should_allocate():
@@ -488,7 +499,9 @@ class FusedSchedulerNode(BaseSchedulerNode):
         self.scheduler = scheduler
         self.node = None  # type: ignore[assignment]
         self.users = None
-        self.inverse_users = []
+        self.inverse_users = set.union(*[set(x.inverse_users) for x in snodes])
+        self.inverse_users = sorted(set(self.inverse_users - set(snodes)), key=lambda x: x.get_name())
+
         self.group = max(snodes, key=lambda x: int(x.is_reduction())).group
         self.recursive_predecessors = functools.reduce(
             set.union, [x.recursive_predecessors for x in snodes]
@@ -508,6 +521,12 @@ class FusedSchedulerNode(BaseSchedulerNode):
         } - self.read_writes.writes
         self.min_order = min([x.min_order for x in self.snodes])
         self.max_order = max([x.max_order for x in self.snodes])
+
+    @property
+    @cache_on_self
+    def node_users(self):
+        all_users = set.union(*[set(x.node_users) for x in self.snodes])
+        return sorted(all_users - set(self.snodes), key=lambda x: x.get_name())
 
     @cache_on_self
     def get_name(self) -> str:
@@ -724,9 +743,14 @@ class Scheduler:
 
         metrics.ir_nodes_pre_fusion += len(self.nodes)
         V.debug.ir_pre_fusion(self.nodes)
+
+        comms.decide_global_ordering_comms(self.nodes)
+
+        self.compute_predecessors()
         self.num_orig_nodes = len(self.nodes)
         self.name_to_fused_node = {n.get_name(): n for n in self.nodes}
         self.create_foreach_nodes()
+
         self.fuse_nodes()
         self.compute_last_usage()
         V.debug.ir_post_fusion(self.nodes)
