@@ -21,6 +21,7 @@ from ..exc import (
 )
 from ..guards import GuardBuilder
 from ..replay_record import DummyModule
+from ..side_effects import SideEffects
 from ..source import AttrSource, is_constant_source, SuperSource, TypeSource
 from ..utils import (
     build_checkpoint_variable,
@@ -1113,6 +1114,33 @@ class BuiltinVariable(VariableTracker):
                 raise AttributeMutationError(
                     "Can't inplace modify module params/buffers inside HigherOrderOp"
                 )
+
+            if (
+                isinstance(name_var, ConstantVariable)
+                and obj.is_buffer(tx, name_var)
+                and SideEffects.cls_supports_mutation_side_effects(obj.module_type)
+            ):
+                # This guard checks that the names of the buffers remain intact
+                obj.guards.add(
+                    obj.source.make_guard(GuardBuilder.NN_MODULE_BUFFER_NAMES)
+                )
+
+                # Its a buffer, so we can mutate the buffer in the graph module itself
+                name = name_var.value
+                buffer_var = obj.var_getattr(tx, name)
+                buffer_node = buffer_var.as_proxy().node
+                new_value_node = val.as_proxy().node
+                tx.output.create_node(
+                    "call_function", torch.fill_, (buffer_node, new_value_node), {}
+                )
+                return buffer_var
+
+            # We don't allow side effects during export
+            # https://github.com/pytorch/torchdynamo/issues/1475
+            assert (
+                not tx.export
+            ), f"Mutating module attribute {tx.current_instruction.argval} during export."
+
             obj.convert_to_unspecialized(tx)
 
     def call_delattr(self, tx, obj: VariableTracker, name_var: VariableTracker):
