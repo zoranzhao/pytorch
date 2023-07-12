@@ -172,8 +172,9 @@ inductor_expected_failures_single_sample["cpu"] = {
     "bucketize": {b8, f16, f32, f64, i32, i64},
     "cholesky": {f32, f64},
     "combinations": {b8, f16, f32, f64, i32, i64},
-    "corrcoef": {f32, f64, i32, i64},
-    "cov": {f32, f64, i32, i64},
+    # Unsupported: data dependent operator: aten.equal.default
+    "corrcoef": {f16, f32, f64, i32, i64},
+    "cov": {f16, f32, f64, i32, i64},
     "equal": {b8, f16, f32, f64, i32, i64},
     "index_add": {f16},
     "index_reduce": {f16, f32, f64},
