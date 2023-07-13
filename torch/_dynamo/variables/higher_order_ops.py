@@ -57,16 +57,23 @@ def are_tensors(var):
 def validate_args_and_maybe_create_graph_inputs(
     sub_args, tracer, tx, manually_set_subgraph_inputs
 ):
-    from . import AutogradFunctionContextVariable, ConstantVariable, TensorVariable
+    from . import (
+        AutogradFunctionContextVariable,
+        ConstantVariable,
+        NNModuleVariable,
+        TensorVariable,
+    )
     from .builder import wrap_fx_proxy
 
     args = []
-    for a in sub_args:
+
+    # One argument to graph per sub_args
+    def add_subarg(subarg):
         assert isinstance(a, VariableTracker)
 
         if isinstance(a, ConstantVariable):
             # Ensures that we recompile when the constant value changes
-            a.add_guard(GuardBuilder.CONSTANT_MATCH)
+            subarg.add_guard(GuardBuilder.CONSTANT_MATCH)
 
             if manually_set_subgraph_inputs:
                 # This arg is not used in the body of the higher order op.
@@ -74,26 +81,35 @@ def validate_args_and_maybe_create_graph_inputs(
                 # happy, which expect a fixed number of arguments. In
                 # future, we can clean this up.
                 tracer.create_graph_input("const")
-            new_arg = a
-        elif isinstance(a, TensorVariable):
+            new_arg = subarg
+        elif isinstance(subarg, TensorVariable):
             if manually_set_subgraph_inputs:
-                new_proxy = tracer.create_graph_input(a.as_proxy().node.name)
-                example_value = a.as_proxy().node.meta["example_value"]
+                new_proxy = tracer.create_graph_input(subarg.as_proxy().node.name)
+                example_value = subarg.as_proxy().node.meta["example_value"]
                 new_arg = wrap_fx_proxy(
                     tx=tx, proxy=new_proxy, example_value=example_value
                 )
             else:
-                new_arg = a
-        elif isinstance(a, AutogradFunctionContextVariable):
+                new_arg = subarg
+        elif isinstance(subarg, AutogradFunctionContextVariable):
             if manually_set_subgraph_inputs:
-                tracer.create_graph_input(a.as_proxy().node.name)
-            new_arg = a
+                tracer.create_graph_input(subarg.as_proxy().node.name)
+            new_arg = subarg
+        elif not isinstance(
+            subarg, NNModuleVariable
+        ) and subarg.has_unpack_var_sequence(tx):
+            new_arg = []
+            for sub_a in subarg.unpack_var_sequence(tx):
+                new_arg.append(add_subarg(sub_a))
+            new_arg = subarg
         else:
             raise unimplemented(
                 "HigherOrderOperator with body that accepts non-Tensors as input"
             )
+        return new_arg
 
-        args.append(new_arg)
+    for a in sub_args:
+        args.append(add_subarg(a))
     return args
 
 
@@ -219,6 +235,19 @@ def add_subgraph(tx, source, name, gm):
     gm.torchdynamo_force_dynamic = False
     tx.output.register_attr_or_module(gm, next_name, source=src)
     return next_name
+
+
+def _unpack(tx, item):
+    from . import NNModuleVariable, TensorVariable
+
+    if isinstance(item, TensorVariable):
+        return item.as_proxy().node.meta["example_value"].contiguous()
+    if not isinstance(item, NNModuleVariable) and item.has_unpack_var_sequence(tx):
+        r_items = []
+        for sub_item in item.unpack_var_sequence(tx):
+            r_items.append(_unpack(tx, sub_item))
+        return item.python_type()(r_items)
+    raise RuntimeError("Unsupported autograd w/ grad return type.")
 
 
 class TorchHigherOrderOperatorVariable(VariableTracker):
@@ -665,14 +694,10 @@ class FunctorchGradHigherOrderVariable(TorchHigherOrderOperatorVariable):
         # For has_aux=True, Tuple[Tuple[gradients of inputs indicated by argnums], aux values]
         # NOTE: example_value should match `grad_output`.
         if isinstance(argnums.value, int):
-            example_value = (
-                args[argnums.value].as_proxy().node.meta["example_value"].contiguous()
-            )
+            arg = args[argnums.value]
+            example_value = _unpack(tx, arg)
         else:
-            example_value = tuple(
-                args[idx].as_proxy().node.meta["example_value"].contiguous()
-                for idx in argnums.value
-            )
+            example_value = tuple(_unpack(tx, args[idx]) for idx in argnums.value)
 
         if has_aux.value:
             # case : has_aux = True
@@ -772,8 +797,8 @@ class AutogradFunctionMethodHigherOrderVariable(TorchHigherOrderOperatorVariable
             *(arg.as_proxy() for arg in args),
             *(arg for arg in body_lifted_freevars.keys()),
         )
-        r = body_r.as_proxy().node.meta["example_value"]
-        example_value = r
+
+        example_value = _unpack(tx, body_r)
 
         _, p_kwargs = proxy_args_kwargs([], kwargs)
 
