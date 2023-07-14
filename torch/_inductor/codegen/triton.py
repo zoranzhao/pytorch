@@ -1175,6 +1175,8 @@ class TritonKernel(Kernel):
             self._load_mask = prior
 
     def indirect_indexing(self, var, size, check=True):
+        # TODO(lezcano) This code should be lifted to codegen/common.py.
+        # This should be easy, as now CSE variables carry bounds info
         class IndirectAssertLine(DeferredLineBase):
             def __init__(self, line, var, mask, size_map):
                 self.var = var
@@ -1211,6 +1213,31 @@ class TritonKernel(Kernel):
 
             def _new_line(self, line):
                 return IndirectAssertLine(line, self.var, self.mask, self.size_map)
+
+        if var.bounds.lower < 0:
+            str_size = self.index_to_str(size)
+            new_bounds = ValueRanges.unknown()
+            if var.bounds != ValueRanges.unknown() and (
+                not isinstance(size, sympy.Expr) or size.is_constant()
+            ):
+                # Take the negative part of the bound and add size to it
+                # Then take union of that and the positive part
+                # This is a tighter bound than that of a generic ops.where, as we have info on the cond
+                neg = var.bounds & ValueRanges(-sympy.oo, -1)
+                new_bounds = ValueRanges(neg.lower + size, neg.upper + size)
+                # We don't have a good way of representing the empty range
+                if var.bounds.upper >= 0:
+                    pos = var.bounds & ValueRanges(0, sympy.oo)
+                    new_bounds = new_bounds | pos
+
+            new_var = self.cse.generate(
+                self.compute,
+                f"tl.where({var} < 0, {var} + {str_size}, {var})",
+                bounds=new_bounds,
+            )
+
+            new_var.update_on_args("index_wrap", (var,), {})
+            var = new_var
 
         generate_assert = (
             (check or config.debug_index_asserts)
