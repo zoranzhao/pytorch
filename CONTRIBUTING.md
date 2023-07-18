@@ -28,6 +28,7 @@ aspects of contributing to PyTorch.
     - [Tips](#tips)
     - [Building C++ Documentation](#building-c-documentation)
   - [Previewing changes locally](#previewing-changes-locally)
+  - [Adding diagrams](#adding-diagrams)
   - [Previewing documentation on PRs](#previewing-documentation-on-prs)
   - [Adding documentation tests](#adding-documentation-tests)
 - [Profiling with `py-spy`](#profiling-with-py-spy)
@@ -185,6 +186,10 @@ Pulling will reinstall the PyTorch dependencies as well as the nightly binaries
 into the repo directory.
 
 ## Codebase structure
+
+A diagram of the important parts of the codebase
+![code base structure](simplified-codebase-structure.svg)
+
 
 * [c10](c10) - Core library files that work everywhere, both server
   and mobile. We are slowly moving pieces from [ATen/core](aten/src/ATen/core)
