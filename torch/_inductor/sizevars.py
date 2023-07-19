@@ -31,7 +31,10 @@ class SizeVarAllocator:
         self._simplify_loops = self.make_simplify_loops_cache()
 
     def simplify(self, expr: Expr):
-        return sympy.expand(expr).xreplace(self.replacements)
+        assert isinstance(expr, (int, Expr)), type(expr)
+        if isinstance(expr, int):
+            return expr
+        return self.shape_env.simplify(expr)
 
     def make_simplify_with_ranges_cache(self):
         """
