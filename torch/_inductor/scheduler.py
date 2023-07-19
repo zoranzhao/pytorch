@@ -6,7 +6,7 @@ import logging
 import os
 import pprint
 import textwrap
-from typing import Dict, List, Optional, Set
+from typing import Counter, Dict, List, Optional, Set
 
 import sympy
 
@@ -52,8 +52,12 @@ class OutputNode:
 def fuse(node1: "BaseSchedulerNode", node2: "BaseSchedulerNode"):
     if node1.is_foreach():
         return ForeachKernelSchedulerNode.fuse(node1, node2)
-    else:
+    elif isinstance(node1, SchedulerNode) and isinstance(node2, SchedulerNode):
         return FusedSchedulerNode.fuse(node1, node2)
+    else:
+        raise RuntimeError(
+            f"Unsupported node type for fusion: {type(node1)=}, {type(node2)=}"
+        )
 
 
 class BaseSchedulerNode:
@@ -66,7 +70,9 @@ class BaseSchedulerNode:
         self.recursive_predecessors: Optional[Set[str]] = None
         self.min_order: Optional[int] = None
         self.max_order: Optional[int] = None
-        self.last_usage: Set[str] = None  # buffers that won't be used after this kernel
+        self.last_usage: Optional[
+            Set[str]
+        ] = None  # buffers that won't be used after this kernel
         self.written = False
 
     def __repr__(self):
@@ -158,7 +164,7 @@ class BaseSchedulerNode:
                 # needed to avoid deallocating aliased buffer
                 # if there are still uses of aliases ahead
                 if isinstance(layout, ir.AliasedLayout):
-                    used_names.add(layout.view.data.get_name())
+                    used_names.add(layout.view.get_name())
         return used_names
 
     def prune_deps(self):
@@ -177,7 +183,7 @@ class BaseSchedulerNode:
         In essence this enforces an ordering on fusions. As fusions occur, prunable stardeps will
         be incrementally removed, enabling other fusions, ensuring they are fused in order.
         """
-        name_to_dep_count = collections.Counter()
+        name_to_dep_count: Counter[Dict[str, int]] = collections.Counter()
 
         for dep in self.unmet_dependencies:
             if not isinstance(dep, WeakDep):
@@ -263,10 +269,14 @@ class BaseSchedulerNode:
             ordered_reads = sorted(self.read_writes.reads, key=lambda x: x.name)
 
             for read in ordered_reads:
-                input_node: BaseSchedulerNode = self.scheduler.name_to_node.get(
-                    read.name
-                )
-                if input_node and V.graph.wrapper_code.can_reuse(input_node):
+                input_node: Optional[
+                    BaseSchedulerNode
+                ] = self.scheduler.name_to_node.get(read.name)
+                if (
+                    input_node
+                    and V.graph.wrapper_code.can_reuse(input_node)
+                    and input_node.users
+                ):
                     remaining_uses = [
                         x
                         for x in input_node.users
@@ -307,12 +317,15 @@ class BaseSchedulerNode:
                                 V.kernel.mutations.add(self.get_name())
 
                             # update last usage of reused node
-                            self.last_usage.discard(input_node.get_name())
+                            if self.last_usage is not None:
+                                self.last_usage.discard(input_node.get_name())
 
                         return
         V.graph.wrapper_code.codegen_allocation(self.node)
 
     def can_free(self):
+        if self.users is None:
+            return True
         for use in self.users:
             if isinstance(use.node, OutputNode):
                 return False
@@ -494,9 +507,9 @@ class FusedSchedulerNode(BaseSchedulerNode):
     """
 
     @classmethod
-    def fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode):
+    def fuse(cls, node1: SchedulerNode, node2: SchedulerNode):
         assert node1.scheduler is node2.scheduler
-        return cls(node1.scheduler, node1.get_nodes() + node2.get_nodes())
+        return cls(node1.scheduler, node1.get_nodes() + node2.get_nodes())  # type: ignore
 
     def __init__(self, scheduler: "Scheduler", snodes: List[SchedulerNode]):
         # NB: No need to call super().__init__() because we don't need to re-use any of its logic.
@@ -507,7 +520,12 @@ class FusedSchedulerNode(BaseSchedulerNode):
         self.inverse_users = []
         self.group = max(snodes, key=lambda x: int(x.is_reduction())).group
         self.recursive_predecessors = functools.reduce(
-            set.union, [x.recursive_predecessors for x in snodes]
+            set.union,
+            [
+                x.recursive_predecessors
+                for x in snodes
+                if x.recursive_predecessors is not None
+            ],
         )
         self.set_read_writes(
             functools.reduce(
@@ -522,8 +540,12 @@ class FusedSchedulerNode(BaseSchedulerNode):
             )
             if dep.name not in names
         } - self.read_writes.writes
-        self.min_order = min([x.min_order for x in self.snodes])
-        self.max_order = max([x.max_order for x in self.snodes])
+        self.min_order = min(
+            [x.min_order for x in self.snodes if x.min_order is not None]
+        )
+        self.max_order = max(
+            [x.max_order for x in self.snodes if x.max_order is not None]
+        )
 
     @cache_on_self
     def get_name(self) -> str:
@@ -549,9 +571,10 @@ class FusedSchedulerNode(BaseSchedulerNode):
         super().set_last_usage(future_used_buffers, mutation_real_name)
         # Set self.last_usage on the snodes
         # This will be used for optimisations within the kernel
-        future_used_buffers = set()
+        future_used_buffers: Set[str] = set()
         for node in reversed(self.snodes):
             node.set_last_usage(future_used_buffers, mutation_real_name)
+            assert node.last_usage is not None
             future_used_buffers.update(node.last_usage)
 
     @cache_on_self
@@ -565,7 +588,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
         )
 
     def get_nodes(self) -> List[BaseSchedulerNode]:
-        return self.snodes
+        return self.snodes  # type: ignore[return-value]
 
     def __repr__(self):
         return f"{type(self).__name__}(nodes={self.get_name()})"
@@ -590,7 +613,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
 
     @cache_on_self
     def op_counts(self):
-        op_counts = collections.Counter()
+        op_counts: Counter[Dict[str, int]] = collections.Counter()
         for node in self.snodes:
             op_counts.update(node.op_counts())
         return op_counts
@@ -655,7 +678,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
         self.group = (nodes[0].get_device(), 0)
         self.snodes = nodes
         self.node_set = set(nodes)
-        self.origins = set()
+        self.origins: Set[torch.fx.Node] = set()
 
     def mark_run(self):
         raise NotImplementedError
@@ -679,7 +702,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
         return list(itertools.chain(*[x.get_nodes() for x in self.snodes]))
 
     def can_fuse(self, other: SchedulerNode):
-        if other.is_foreach():
+        if isinstance(other, ForeachKernelSchedulerNode):
             return len(self.snodes) == len(other.snodes) and all(
                 self.scheduler.can_fuse(l, r) for l, r in zip(self.snodes, other.snodes)
             )
@@ -760,7 +783,6 @@ class Scheduler:
             node.prune_deps()
 
         self.name_to_node = {n.get_name(): n for n in self.nodes}
-        self.name_to_fused_node = None  # set in fuse_nods()
 
         # we handle mutation by renaming modified versions of the same
         # buffer in the dependency graph to prevent cycles.
@@ -845,7 +867,7 @@ class Scheduler:
         Create dependency edges between nodes, handling aliasing and
         mutation properly.
         """
-        name_to_users = collections.defaultdict(list)
+        name_to_users: Dict[str, List[NodeUser]] = collections.defaultdict(list)
 
         # handle aliasing by using python aliasing in name_to_users
         # if foo aliases bar then we will make name_to_users["foo"] point
@@ -963,7 +985,7 @@ class Scheduler:
         Ensure self.nodes is in topologically sorted order
         """
         seen = set()
-        name_to_node = dict()
+        name_to_node: Dict[str, ir.ComputedBuffer] = dict()
         result = []
 
         def visit(n):
@@ -985,7 +1007,7 @@ class Scheduler:
         Populate each node.recursive_predecessors
         """
         # note self.nodes is topologically sorted
-        name_to_predecessors = {}
+        name_to_predecessors: Dict[str, Set[str]] = {}
         for node in self.nodes:
             recursive_predecessors = set()
             for dep in node.unmet_dependencies:
@@ -1132,6 +1154,12 @@ class Scheduler:
         node changes live intervals, and re-computing live intervals and peak
         memory after each fusion can introduce large compilation overhead.
         """
+        assert (
+            node1.min_order is not None
+            and node1.max_order is not None
+            and node2.min_order is not None
+            and node2.max_order is not None
+        )
         proximity_score = max(
             abs(node1.min_order - node2.max_order),
             abs(node2.min_order - node1.max_order),
@@ -1155,7 +1183,10 @@ class Scheduler:
             and not node2.is_template()
         ):
             return False
-        if node2.get_names() & node1.recursive_predecessors:
+        if (
+            node1.recursive_predecessors is not None
+            and node2.get_names() & node1.recursive_predecessors
+        ):
             return False  # node2 must go before node1
         if node2.is_template():
             return False  # only epilogues
@@ -1183,7 +1214,10 @@ class Scheduler:
         ):
             return False  # heuristic not needed for correctness
 
-        if node1.get_names() & node2.recursive_predecessors:
+        if (
+            node2.recursive_predecessors is not None
+            and node1.get_names() & node2.recursive_predecessors
+        ):
             # node2 depends on node1 outputs
             if not self.can_fuse_vertical(node1, node2):
                 return False
@@ -1246,6 +1280,12 @@ class Scheduler:
         - Fusions closer together in original order
         """
         memory_score = self.score_fusion_memory(node1, node2)
+        assert (
+            node1.min_order is not None
+            and node1.max_order is not None
+            and node2.min_order is not None
+            and node2.max_order is not None
+        )
         proximity_score = -max(
             abs(node1.min_order - node2.max_order),
             abs(node2.min_order - node1.max_order),

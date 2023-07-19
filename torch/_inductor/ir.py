@@ -2132,6 +2132,9 @@ class Buffer(IRNode):
     def realize(self):
         pass
 
+    def should_allocate(self):
+        raise NotImplementedError()
+
 
 class InputBuffer(Buffer):
     pass
