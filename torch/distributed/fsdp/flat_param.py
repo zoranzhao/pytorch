@@ -510,6 +510,15 @@ class FlatParamHandle:
         # it points to parameterizes behavior. We use the following attribute
         # to track which tensor data the parameters are unsharded views into.
         self._unsharded_flat_param_for_skipped_views: Optional[Tensor] = None
+        # Maps each handle to its index in `all_handles`, which must be the
+        # same across ranks for the execution order validation to work
+        self._handle_index = None
+        
+        # NOTE: For the code path using this flag, we only skip calling
+        # `_use_sharded_views()` and do not skip switching to the sharded flat
+        # parameter since whether `self.flat_param` uses the sharded or
+        # unsharded flat parameter parameterizes behavior.
+        self._skipped_use_sharded_views = False
         # Optimistically assume a valid input `params` and set dtype attributes
         # before `_init_flat_param()`, which performs the actual validation
         self._orig_param_dtype = params[0].dtype
