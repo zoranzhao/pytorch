@@ -21,8 +21,7 @@ The new ATen C++ bindings definitions are in the native folder.
 ### Native folder
 
 #### The native functions yaml file
-The Native folder contains [native-functions.yaml](native-functions.yaml). This file contains definitions 
-of the PyTorch operations, for example:
+The Native folder contains [native-functions.yaml](native-functions.yaml). This file contains definitions of the PyTorch operations, for example:
 
 `func: hardsigmoid(Tensor self) -> Tensor
   structured_delegate: hardsigmoid.out
@@ -32,7 +31,7 @@ of the PyTorch operations, for example:
   QuantizedCPU: hardsigmoid_quantized_cpu`
 
 It defines operations and how they are dispatched, and other related information required to run the operations for each kernel.
-The frontend operations (what the PyTorch developer writes) are written without regard for which device operations will be run on. 
+The frontend operations (what the PyTorch developer writes) are written without regard for which device operations will be run on.
 The yaml file is the way to map operations so they can be run on particualr kernels; it does this by declaring
 how each operation will be implemented; including which devices an operation can run on and how it will be dispatched.
 The yaml file is used as input to generate code by the [setup.py](../../setup.py). The code is generated in the ATen
