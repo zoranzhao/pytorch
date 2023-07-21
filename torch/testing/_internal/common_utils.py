@@ -929,6 +929,8 @@ def run_tests(argv=UNITTEST_ARGS):
         import pytest
         os.environ["NO_COLOR"] = "1"
         exit_code = pytest.main(args=pytest_args)
+        for file in sorted(list(experiment)):
+            print(file)
         if TEST_SAVE_XML:
             sanitize_pytest_xml(test_report_path)
 
@@ -2140,6 +2142,7 @@ class TypedStoragePair(TensorLikePair):
             device=typed_storage.device,
         )
 
+experiment = set()
 
 class UnittestPair(Pair):
     """Fallback ABC pair that handles non-numeric inputs.
@@ -2527,8 +2530,8 @@ This message can be suppressed by setting PYTORCH_PRINT_REPRO_ON_FAILURE=0"""
                     num_red=0,
                     num_green=0)
                 prof.snapshot_stats()
-                for file in sorted(list(set(k[0] for k in prof.stats))):
-                    print(file)
+                for file in set(k[0] for k in prof.stats):
+                    experiment.add(file)
 
     def setUp(self):
         check_if_enable(self)
