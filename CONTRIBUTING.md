@@ -188,7 +188,9 @@ into the repo directory.
 ## Codebase structure
 
 A diagram of the parts of the codebase showing at a high level picture, the frontend, backend, ATen and kernels. 
-![code base structure](simplified-codebase-structure.png)
+
+![code base structure](simplified-codebase-structure.svg)
+
 
 
 * [c10](c10) - Core library files that work everywhere, both server
