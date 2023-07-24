@@ -188,7 +188,7 @@ into the repo directory.
 ## Codebase structure
 
 A diagram of the parts of the codebase showing at a high level picture, the frontend, backend, ATen and kernels. 
-![code base structure](simplified-codebase-structure.svg)
+![code base structure](simplified-codebase-structure.png)
 
 
 * [c10](c10) - Core library files that work everywhere, both server
@@ -564,6 +564,14 @@ mkdir -p build cpp/build
 rsync -az me@my_machine:/path/to/pytorch/docs/build/html build
 rsync -az me@my_machine:/path/to/pytorch/docs/cpp/build/html cpp/build
 ```
+
+### Adding Diagrams
+
+Diagrams should be authored as [svg](https://en.wikipedia.org/wiki/SVG) files, so they can be updated by other users.
+A way to author svg files is to use [https://app.diagrams.net/](https://app.diagrams.net/).
+If the diagram is part of the documentation, then the svg file can be displayed as-is.
+If the diagram is part of a markdown file, then a [png](https://en.wikipedia.org/wiki/PNG) file should be created and referred to.
+In this case the svg file should also be put in git so that the changes can be made.
 
 ### Previewing documentation on PRs
 
