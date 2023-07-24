@@ -182,6 +182,7 @@ class ModuleInfo:
                  module_memformat_affects_out=False,  # whether converting module to channels last will generate
                                                       # channels last output
                  train_and_eval_differ=False,  # whether the module has differing behavior between train and eval
+                 gradcheck_memformat=True,  # whether check backward when test channels last
                  ):
         self.module_cls = module_cls
         self.module_inputs_func = module_inputs_func
@@ -191,6 +192,7 @@ class ModuleInfo:
         self.gradcheck_nondet_tol = gradcheck_nondet_tol
         self.module_memformat_affects_out = module_memformat_affects_out
         self.train_and_eval_differ = train_and_eval_differ
+        self.gradcheck_memformat = gradcheck_memformat
 
     def get_decorators(self, test_class, test_name, device, dtype, param_kwargs):
         result = [set_single_threaded_if_parallel_tbb]
@@ -2253,6 +2255,8 @@ module_db: List[ModuleInfo] = [
                ),
     ModuleInfo(torch.nn.AdaptiveAvgPool2d,
                gradcheck_nondet_tol=GRADCHECK_NONDET_TOL,
+               # Fails on backward check if output size is 1x1
+               gradcheck_memformat=False,
                module_inputs_func=module_inputs_torch_nn_AdaptiveAvgPool2d,
                skips=(
                    # Fails on MPS backend if input/output sizes are not divisible
@@ -2291,9 +2295,10 @@ module_db: List[ModuleInfo] = [
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
                ),
     ModuleInfo(torch.nn.AvgPool2d,
+               gradcheck_memformat=False,
                module_inputs_func=module_inputs_torch_nn_AvgPool2d,
                skips=(
-                   DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
+                   DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),),
                ),
     ModuleInfo(torch.nn.AvgPool3d,
                module_inputs_func=module_inputs_torch_nn_AvgPool3d,
@@ -2327,6 +2332,7 @@ module_db: List[ModuleInfo] = [
                ),
     ModuleInfo(torch.nn.BatchNorm2d,
                train_and_eval_differ=True,
+               gradcheck_memformat=False,
                module_inputs_func=module_inputs_torch_nn_BatchNorm2d,
                skips=(
                    # test fails on MPS backend and is being investigated.
@@ -2348,6 +2354,8 @@ module_db: List[ModuleInfo] = [
                ),
     ModuleInfo(torch.nn.BatchNorm3d,
                train_and_eval_differ=True,
+               # Fails on backward check on CUDA
+               gradcheck_memformat=False,
                module_inputs_func=module_inputs_torch_nn_BatchNorm3d,
                skips=(
                    # not supported on MPS backend
@@ -2467,6 +2475,9 @@ module_db: List[ModuleInfo] = [
                    DecorateInfo(skipCUDAIfRocm, 'TestModule', 'test_memory_format', dtypes=[torch.float32]),
                    DecorateInfo(skipIfMps, 'TestModule',
                                 dtypes=complex_types_and(torch.chalf, torch.float64, torch.complex128)),
+                   # Fails on backward check because ViewAsRealBackward apply contiguous for grad
+                   DecorateInfo(unittest.expectedFailure, 'TestModule', 'test_memory_format',
+                                dtypes=(torch.complex32, torch.complex64, torch.complex128)),
                    # This was wrongly being skipped before and needs investigation.
                    # See https://github.com/pytorch/pytorch/issues/80247
                    DecorateInfo(unittest.expectedFailure, "TestModule", "test_memory_format", device_type='cuda',
@@ -2715,6 +2726,8 @@ module_db: List[ModuleInfo] = [
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
                ),
     ModuleInfo(torch.nn.LPPool2d,
+               # Fails on backward check on mps
+               gradcheck_memformat=False,
                module_inputs_func=module_inputs_torch_nn_LPPool2d,
                skips=(
                    DecorateInfo(unittest.skip("Skipped!"), 'TestModule', 'test_grad'),
@@ -2786,6 +2799,8 @@ module_db: List[ModuleInfo] = [
                    DecorateInfo(skipMPS),),
                ),
     ModuleInfo(torch.nn.Hardswish,
+               # Fails on backward check on mps
+               gradcheck_memformat=False,
                module_inputs_func=module_inputs_torch_nn_Hardswish,
                skips=(
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),),
@@ -2887,6 +2902,8 @@ module_db: List[ModuleInfo] = [
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
                ),
     ModuleInfo(torch.nn.ReLU,
+               # Fails on backward check on MPS
+               gradcheck_memformat=False,
                module_inputs_func=module_inputs_torch_nn_ReLU,
                skips=(
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
@@ -2927,6 +2944,8 @@ module_db: List[ModuleInfo] = [
                ),
     ModuleInfo(torch.nn.Sigmoid,
                module_inputs_func=module_inputs_torch_nn_Sigmoid,
+               # Fails on backward check on MPS
+               gradcheck_memformat=False,
                skips=(
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
                ),
@@ -2986,11 +3005,15 @@ module_db: List[ModuleInfo] = [
                ),
     ModuleInfo(torch.nn.Tanh,
                module_inputs_func=module_inputs_torch_nn_Tanh,
+               # Fails on backward check on MPS
+               gradcheck_memformat=False,
                skips=(
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
                ),
     ModuleInfo(torch.nn.Tanhshrink,
                module_inputs_func=module_inputs_torch_nn_Tanhshrink,
+               # Fails on backward check on MPS
+               gradcheck_memformat=False,
                skips=(
                    DecorateInfo(skipIfMps, 'TestModule', dtypes=[torch.float64]),)
                ),
