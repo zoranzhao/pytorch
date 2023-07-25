@@ -44,6 +44,9 @@ if IS_ROCM and not IS_MEM_LEAK_CHECK:
     except subprocess.CalledProcessError as e:
         # The safe default for ROCm GHA runners is to run tests serially.
         NUM_PROCS = 1
+elif not IS_MEM_LEAK_CHECK and torch.cuda.is_available():
+    total_cuda_mem_mib = torch.cuda.mem_get_info()[1] >> 20
+    NUM_PROCS = total_cuda_mem_mib // 4
 
 
 class ShardedTest(NamedTuple):

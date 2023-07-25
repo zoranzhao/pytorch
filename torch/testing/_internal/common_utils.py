@@ -1107,9 +1107,11 @@ TEST_CUDA_GRAPH = TEST_CUDA and (not TEST_SKIP_CUDAGRAPH) and (
 
 if TEST_CUDA and 'NUM_PARALLEL_PROCS' in os.environ:
     num_procs = int(os.getenv("NUM_PARALLEL_PROCS", "2"))
-    # other libraries take up about 11% of space per process
-    torch.cuda.set_per_process_memory_fraction(round(1 / num_procs - .11, 2))
-
+    # Other libraries and the cuda context take up about 1 MB of space.  We want
+    # each proc to have at least 3 MB of space.
+    total_cuda_mem_mib = torch.cuda.mem_get_info()[1] >> 20
+    mem_per_proc = (total_cuda_mem_mib - num_procs) / num_procs
+    torch.cuda.set_per_process_memory_fraction(round(mem_per_proc / total_cuda_mem_mib, 2))
 
 def skipIfCrossRef(fn):
     @wraps(fn)
