@@ -12,6 +12,7 @@ from tools.shared.logging_utils import duration_to_str, pluralize
 
 from tools.stats.import_test_stats import get_disabled_tests, get_slow_tests
 from tools.stats.upload_stats_lib import emit_metric
+import torch
 
 IS_MEM_LEAK_CHECK = os.getenv("PYTORCH_TEST_CUDA_MEM_LEAK_CHECK", "0") == "1"
 
@@ -45,8 +46,6 @@ if IS_ROCM and not IS_MEM_LEAK_CHECK:
         # The safe default for ROCm GHA runners is to run tests serially.
         NUM_PROCS = 1
 elif not IS_MEM_LEAK_CHECK and torch.cuda.is_available():
-    import torch
-
     total_cuda_mem_mib = torch.cuda.mem_get_info()[1] >> 20
     NUM_PROCS = total_cuda_mem_mib // 4
 
