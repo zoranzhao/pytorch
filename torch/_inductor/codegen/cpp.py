@@ -95,9 +95,28 @@ DTYPE_TO_ATEN = {
     torch.complex64: "at::kComplexFloat",
 }
 
+DTYPE_TO_AOT = {
+    torch.float32: "kAOTInductorFloat",
+    torch.float64: "kAOTInductorDouble",
+    torch.float16: "kAOTInductorHalf",
+    torch.int64: "kAOTInductorLong",
+    torch.int32: "kAOTInductorInt",
+    torch.int16: "kAOTInductorShort",
+    torch.int8: "kAOTInductorChar",
+    torch.uint8: "kAOTInductorByte",
+    torch.bool: "kAOTInductorBool",
+    torch.bfloat16: "kAOTInductorBFloat16",
+    torch.complex64: "kAOTInductorComplexFloat",
+}
+
 DEVICE_TO_ATEN = {
     "cpu": "at::kCPU",
     "cuda": "at::kCUDA",
+}
+
+DEVICE_TO_AOT = {
+    "cpu": "kAOTInductorCPU",
+    "cuda": "kAOTInductorCUDA",
 }
 
 INDEX_TYPE = "long"

@@ -2,16 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-#ifdef __GNUC__
-#define AOT_INDUCTOR_EXPORT __attribute__((__visibility__("default")))
-#else // !__GNUC__
-#ifdef _WIN32
-#define AOT_INDUCTOR_EXPORT __declspec(dllexport)
-#else // !_WIN32
-#define AOT_INDUCTOR_EXPORT
-#endif // _WIN32
-#endif // __GNUC__
+#include <torch/csrc/aot_inductor/c/utils.h>
 
 enum class AOTInductorError : int {
   Success = 0,
@@ -42,9 +33,10 @@ struct AOTInductorStreamOpaque {};
 using AOTInductorStreamHandle = AOTInductorStreamOpaque*;
 
 struct AOTInductorTensorOpaque {};
-using AOTInductorTensorHandle = AOTInductorTensorOpaque*;
+using AOTInductorInputOutputTensorHandle = AOTInductorTensorOpaque*;
 
 extern "C" {
+
 // Creates an AOTInductor model container. The parameter num_models
 // specifies the number of model instances that may be run concurrently for
 // the same input model.
@@ -59,9 +51,9 @@ AOTInductorError AOTInductorModelContainerDelete(
 // Runs the inference.
 AOTInductorError AOTInductorModelContainerRun(
     AOTInductorModelContainerHandle container_handle,
-    const AOTInductorTensorHandle inputs_handle,
+    AtenTensorHandle* inputs_handle,
     size_t num_inputs,
-    AOTInductorTensorHandle outputs_handle,
+    AtenTensorHandle* outputs_handle,
     size_t num_outputs,
     AOTInductorStreamHandle stream_handle);
 

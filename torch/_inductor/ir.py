@@ -1591,15 +1591,9 @@ class ReinterpretView(BaseView):
         pass
 
     def codegen_reference(self):
-        size = V.graph.wrapper_code.codegen_shape_tuple(self.layout.size)
-        stride = V.graph.wrapper_code.codegen_shape_tuple(self.layout.stride)
-        offset = V.graph.wrapper_code.codegen_sizevar(self.layout.offset)
-        namespace = V.graph.wrapper_code.namespace
-        if offset != "0":
-            return (
-                f"{namespace}as_strided({self.get_name()}, {size}, {stride}, {offset})"
-            )
-        return f"{namespace}as_strided({self.get_name()}, {size}, {stride})"
+        return V.graph.wrapper_code.codegen_as_strided(
+            self.get_name(), self.layout.size, self.layout.stride, self.layout.offset
+        )
 
 
 class SliceView(View):
@@ -2910,20 +2904,16 @@ class ExternKernel(InputsKernel):
 
     def codegen_kwargs(self):
         kwargs = []
-        if self.kwargs:
-            if V.graph.cpp_wrapper:
-                # TODO: use native_functions.yaml as the ground truth
-                assert (
-                    self.ordered_kwargs_for_cpp_kernel
-                ), "ordered_kwargs_for_cpp_kernel has to be provided"
-                for arg_name in self.ordered_kwargs_for_cpp_kernel:
-                    v = self.get_kwargs_value(arg_name)
-                    kwargs.append(V.graph.wrapper_code.val_to_str(v))
-            else:
-                kwargs = [
-                    f"{k}={V.graph.wrapper_code.val_to_str(v)}"
-                    for k, v in self.kwargs.items()
-                ]
+
+        if V.graph.cpp_wrapper:
+            for arg_name in self.ordered_kwargs_for_cpp_kernel:
+                v = self.get_kwargs_value(arg_name)
+                kwargs.append(V.graph.wrapper_code.val_to_str(v))
+        elif self.kwargs:
+            kwargs = [
+                f"{k}={V.graph.wrapper_code.val_to_str(v)}"
+                for k, v in self.kwargs.items()
+            ]
         return kwargs
 
     def codegen_size_asserts(self, wrapper):
@@ -3306,6 +3296,11 @@ class FallbackKernel(ExternKernelAlloc):
                 if V.graph.cpp_wrapper
                 else f"aten.{kernel.__name__}"
             )
+            if schema is None and "_addmm_activation" in self.kernel:
+                # Special handling of _addmm_activation for now
+                schema = getattr(op_overload_packet, "_schema", None) or getattr(
+                    op_overload_packet.default, "_schema", None
+                )
             if schema is not None:
                 self.ordered_kwargs_for_cpp_kernel = [
                     x.name for x in schema.arguments if x.kwarg_only

@@ -648,7 +648,7 @@ def cpp_flags():
 
 
 def optimization_flags():
-    base_flags = "-O3 -ffast-math -fno-finite-math-only"
+    base_flags = "-O0 -g -ffast-math -fno-finite-math-only"
     if config.is_fbcode():
         # FIXME: passing `-fopenmp` adds libgomp.so to the generated shared library's dependencies.
         # This causes `ldopen` to fail in fbcode, because libgomp does not exist in the default paths.
@@ -712,6 +712,7 @@ def get_include_and_linking_paths(
         else:
             # internal remote execution is able to find omp, but not gomp
             libs += ["omp"]
+
         macros = vec_isa.build_macro()
         if macros:
             if config.is_fbcode() and vec_isa != invalid_vec_isa:
@@ -726,6 +727,14 @@ def get_include_and_linking_paths(
                 )
             else:
                 macros = f"-D{macros}"
+
+        if aot_mode and config.aot_inductor.abi_compatible:
+            if macros is None:
+                macros = ""
+            macros += " -D AOT_INDUCTOR_ABI_COMPATIBLE"
+            if cuda:
+                macros += " -D USE_CUDA"
+
         if cuda:
             if config.is_fbcode():
                 libs += ["cuda"]
@@ -826,7 +835,7 @@ class CudaKernelParamCache:
             cubin,
             "cubin",
             hash_type="cubin",
-            specified_dir=config.aot_inductor_output_path,
+            specified_dir=config.aot_inductor.output_path,
         )
         params["cubin_path"] = path
         cls.cache[key] = params
@@ -853,7 +862,7 @@ class AotCodeCache:
             source_code,
             "cpp",
             extra=cpp_command,
-            specified_dir=config.aot_inductor_output_path,
+            specified_dir=config.aot_inductor.output_path,
         )
         if key not in cls.cache:
             from filelock import FileLock

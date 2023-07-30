@@ -5,6 +5,8 @@ import torch._dynamo
 import torch._inductor
 
 
+torch._inductor.config.aot_inductor.abi_compatible = True
+
 class Net(torch.nn.Module):
     def __init__(self):
         super().__init__()
