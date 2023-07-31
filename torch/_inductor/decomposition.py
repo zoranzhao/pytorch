@@ -285,7 +285,7 @@ def full_like(
         dtype=dtype or self.dtype,
         layout=layout or self.layout,
         device=device or self.device,
-        requires_grad=requires_grad or self.requires_grad,
+        requires_grad=requires_grad,
     )
 
 
