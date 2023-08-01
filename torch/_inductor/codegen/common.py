@@ -139,7 +139,7 @@ class DataTypePropagation:
         if node.target == "reduction":
             return node.args[1]
 
-        if node.target.startswith("masked_subblock"):
+        if isinstance(node.target, str) and node.target.startswith("masked_subblock"):
             return self.deduce_node_dtype_by_subgraph(node)
 
         return self.deduce_node_dtype_by_inputs(node)
@@ -677,6 +677,10 @@ class CSE:
     ) -> CSEVariable:
         if isinstance(expr, OpsValue):
             expr = expr.value
+        if isinstance(expr, tuple):
+            for v in expr:
+                assert isinstance(v, CSEVariable)
+            return expr
 
         assert isinstance(expr, (str, CSEVariable)), type(expr)
         assert write or assignment

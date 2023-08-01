@@ -950,7 +950,7 @@ class Reduction(Loops):
         )
 
     @staticmethod
-    def default_value(reduction_type, dtype):
+    def default_accumulator(reduction_type, dtype):
         if reduction_type in {"max", "argmax"}:
             if is_float_dtype(dtype):
                 return float("-inf")
@@ -971,8 +971,15 @@ class Reduction(Loops):
             "prod": 1,
             "xor_sum": 0,
             "any": 0,
-            "var_unnormalized": 0,
+            "welford_reduce": (0, 0, 0),
+            "welford_combine": (0, 0, 0),
         }[reduction_type]
+
+    @staticmethod
+    def default_value(reduction_type, dtype):
+        if reduction_type == "welford_reduce":
+            return 0
+        return Reduction.default_accumulator(reduction_type, dtype)
 
     @classmethod
     def create_multilayer(
@@ -1076,6 +1083,289 @@ class Reduction(Loops):
                 src_dtype,
                 reduction_hint,
             )
+        )
+
+
+def num_reduction_outputs(reduction_type):
+    return 3 if "welford" in reduction_type else 1
+
+
+class WelfordReduction(Reduction):
+    output_index: int
+
+    def __init__(
+        self,
+        device,
+        dtype,
+        inner_fns,
+        ranges,
+        reduction_ranges,
+        reduction_type,
+        reduction_hint,
+        output_index,
+    ):
+        if len(inner_fns) == 1:
+            loader = inner_fns[0]
+        else:
+
+            def loader(idx, reduction_idx):
+                return tuple(fn(idx, reduction_idx) for fn in inner_fns)
+
+        super().__init__(
+            device,
+            dtype,
+            loader,
+            ranges,
+            reduction_ranges,
+            reduction_type,
+            dtype,
+            reduction_hint,
+        )
+        self.output_index = output_index
+
+    def store_reduction(self, output_name, indexer, vars, reduction_vars):
+        values = ops.reduction(
+            self.dtype,
+            self.src_dtype,
+            self.reduction_type,
+            self.inner_fn(vars, reduction_vars),
+        )
+        value = values[self.output_index]
+        return ops.store_reduction(output_name, indexer(vars), value)
+
+    @classmethod
+    def create(  # type: ignore[override]
+        cls,
+        device: torch.device,
+        dtype: torch.dtype,
+        inner_fns: Sequence[Callable[..., Any]],
+        ranges: List[Expr],
+        reduction_ranges: List[Expr],
+        reduction_type: str,
+        reduction_hint: ReductionHint = ReductionHint.DEFAULT,
+    ):
+        assert reduction_type in {"welford_reduce", "welford_combine"}
+
+        reduction_numel = V.graph.sizevars.simplify(sympy_product(reduction_ranges))
+
+        def const(idx, val):
+            def inner_fn(idx):
+                return ops.constant(val, dst_dtype)
+
+            return Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=inner_fn,
+                ranges=list(ranges),
+            )
+
+        if reduction_numel == 0:
+            mean = const(0)
+            m2 = const(0)
+            weight = const(0)
+            return mean, m2, weight
+
+        if reduction_numel == 1:
+
+            def copy(loader):
+                def inner_fn(idx):
+                    reduction_index = [sympy.Integer(0) for _ in reduction_ranges]
+                    return loader(idx, reduction_index)
+
+                return Pointwise.create(
+                    device=device,
+                    dtype=dst_dtype,
+                    inner_fn=inner_fn,
+                    ranges=list(ranges),
+                )
+
+            if reduction_type == "welford_reduce":
+                return copy(inner_fns[0]), const(0), const(1)
+            else:
+                return tuple(copy(fn) for fn in inner_fns)
+
+        # TODO: Unrolled reduction
+        # if (
+        #     isinstance(reduction_numel, sympy.Integer)
+        #     and V.graph.sizevars.size_hint(reduction_numel)
+        #     < config.unroll_reductions_threshold
+        #     and sympy_product(ranges) != 1
+        # ):
+        #     return Pointwise.create(
+        #         device,
+        #         dst_dtype,
+        #         cls._unroll_reduction_fn(
+        #             inner_fn, reduction_ranges, reduction_type, src_dtype
+        #         ),
+        #         ranges,
+        #     )
+
+        # triton doesn't support reduce to single element well, so break it up
+        hint, split = Reduction.num_splits(
+            device,
+            dtype,
+            dtype,
+            inner_fns[0],
+            ranges,
+            reduction_ranges,
+            reduction_type=reduction_type,
+            reduction_numel=reduction_numel,
+        )
+        # intermediate reduction in split can contain complex indexing,
+        # and num_splits will fail to correctly set the hint
+        # reuse the passed hint if available
+        if reduction_hint == ReductionHint.DEFAULT:
+            reduction_hint = hint
+        if split > 1:
+            # triton doesn't support reduce to single element well, so break it up
+            return cls.create_multilayer(
+                device,
+                dtype,
+                inner_fns,
+                ranges,
+                reduction_ranges,
+                reduction_type,
+                split,
+                reduction_hint,
+            )
+
+        results = [
+            TensorBox.create(
+                WelfordReduction(
+                    device,
+                    dtype,
+                    inner_fns,
+                    ranges,
+                    reduction_ranges,
+                    reduction_type,
+                    reduction_hint,
+                    output_idx,
+                )
+            )
+            for output_idx in range(3)
+        ]
+        for t in results:
+            t.realize()
+        return results
+
+    @staticmethod
+    def default_value(reduction_type, dtype):
+        return (0, 0, 0)
+
+    @classmethod
+    def create_multilayer(
+        cls,
+        device: torch.device,
+        dtype: torch.dtype,
+        inner_fns: Sequence[Callable[..., Any]],
+        ranges: List[Expr],
+        reduction_ranges: List[Expr],
+        reduction_type: str,
+        split: int,
+        reduction_hint: ReductionHint,
+    ):
+        """
+        Break a large reduction up into multiple smaller reductions
+        recursively
+        """
+        # TODO Dedup with Reduction
+        reduction_numel = sympy_product(reduction_ranges)
+
+        # TODO(jansel): convert this to dynamic shapes
+        # TODO(jansel): realize the reduction so we can do dynamic indexing
+        reduction_ranges = [
+            sympy.Integer(V.graph.sizevars.evaluate_static_shape(s))
+            for s in reduction_ranges
+        ]
+        reduction_numel = sympy.Integer(
+            V.graph.sizevars.evaluate_static_shape(reduction_numel)
+        )
+
+        if V.graph.sizevars.size_hint(reduction_numel) % split == 0:
+            need_mask = False
+        else:
+            need_mask = True
+
+        split = sympy.Integer(split)
+        block_size = FloorDiv(reduction_numel + (split - 1), split)
+
+        reindex = View.dynamic_reshape_indexer(reduction_ranges, [reduction_numel])
+
+        if need_mask and reduction_type != "welford_combine":
+
+            def constant(idx, reduction_idx, value):
+                return ops.constant(value, dtype)
+
+            return cls.create_multilayer(
+                device=device,
+                dtype=dtype,
+                inner_fns=(
+                    inner_fns[0],
+                    partial(constant, value=0),
+                    partial(constant, value=1),
+                ),
+                ranges=ranges,
+                reduction_ranges=reduction_ranges,
+                reduction_type="welford_combine",
+                split=split,
+                reduction_hint=reduction_hint,
+            )
+
+        def wrapper_fn(index, reduction_index, loader):
+            (reduction_index,) = reduction_index
+            *new_index, reduction_block = index
+            indices = block_size * reduction_block + reduction_index
+
+            def body():
+                return loader(new_index, reindex([indices]))
+
+            if need_mask:
+                mask = ops.lt(
+                    ops.index_expr(indices, torch.int32),
+                    ops.index_expr(reduction_numel, torch.int32),
+                )
+                return ops.masked(mask, body, 0)
+            else:
+                return body()
+
+        intermediates = WelfordReduction.create(
+            device,
+            dtype,
+            tuple(partial(wrapper_fn, loader=loader) for loader in inner_fns),
+            [*ranges, split],
+            [block_size],
+            reduction_type,
+            reduction_hint,
+        )
+        for i in intermediates:
+            i.realize()
+
+        i_loaders = [i.make_loader() for i in intermediates]
+
+        def intermediate_loader_fn(index, reduction_index, loader):
+            return loader([*index, *reduction_index])
+
+        numel_hint = V.graph.sizevars.size_hint(sympy_product(ranges))
+        if split <= 512 and numel_hint <= 512 and reduction_hint == ReductionHint.OUTER:
+            reduction_hint = ReductionHint.OUTER_TINY
+        if (
+            split <= 1024
+            and numel_hint <= 256
+            and reduction_hint == ReductionHint.OUTER
+        ):
+            reduction_hint = ReductionHint.OUTER_TINY
+        return WelfordReduction.create(
+            device,
+            dtype,
+            tuple(
+                partial(intermediate_loader_fn, loader=i.make_loader())
+                for i in intermediates
+            ),
+            ranges,
+            [split],
+            # welford_reduce turns one input into three outputs, which are combined with welford_combine
+            "welford_combine",
+            reduction_hint,
         )
 
 
@@ -4726,6 +5016,12 @@ class LoopBodyBlock:
             def store_reduction(self, name, index, value):
                 index = add_index(index, "writes", name)
                 return self._inner.store_reduction(name, index, value)
+
+            def reduction(self, dtype, src_dtype, reduction_type, value):
+                result = self._inner.reduction(dtype, src_dtype, reduction_type, value)
+                if "welford" in reduction_type:
+                    return tuple(result[i] for i in range(3))
+                return result
 
             def index_expr(self, index, dtype):
                 if isinstance(index, (int, sympy.Integer)):

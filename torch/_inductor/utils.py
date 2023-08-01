@@ -991,3 +991,7 @@ def try_find_schema(schemas, args, kwargs):
             return schema
 
     return None
+
+
+def reduction_num_output(reduction_type):
+    return 3 if "welford" in reduction_type else 1
