@@ -4,12 +4,18 @@
 from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
+from torch._export.serde.type_utils import check, Succeed, pp
 
 # TODO (zhxchen17) Move to a separate file.
 class _Union:
     @classmethod
     def create(cls, **kwargs):
-        assert len(kwargs) == 1
+        assert len(kwargs) == 1, f"{pp(cls)} is a Union. Its constructor take only one input, but received {len(kwargs)} from `{kwargs}`."
+        expected_schema = cls.__dict__["__annotations__"]
+        name, value = list(kwargs.keys())[0], list(kwargs.values())[0]
+        assert name in expected_schema, f"{name} is not an element of the union {pp(cls)}."
+        type_check_result = check(value, expected_schema[name])
+        assert type(type_check_result) == Succeed, f"{pp(cls)} expects {name} of type {pp(expected_schema[name])} but received `{value}` of type {pp(type(value))}."
         return cls(**{**{f.name: None for f in fields(cls)}, **kwargs})  # type: ignore[arg-type]
 
     def __post_init__(self):
