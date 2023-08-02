@@ -894,6 +894,14 @@ def _arg_requires_grad(x: Optional[torch.Tensor]) -> bool:
         return x.requires_grad
     return False
 
+# Today this is only needed in MultiheadAttention.
+# Consider util-ifying if we need it anywhere else.
+def _is_pre_dispatch_tracing():
+    torch_fn_mode_stack = torch.overrides._get_current_function_mode_stack()
+    if len(torch_fn_mode_stack) == 1:
+        if type(torch_fn_mode_stack[0]) == torch.fx.experimental.proxy_tensor.PreDispatchTorchFunctionMode:
+            return True
+    return False
 
 class MultiheadAttention(Module):
     r"""Allows the model to jointly attend to information
@@ -1167,7 +1175,11 @@ class MultiheadAttention(Module):
             )
             # We have to use list comprehensions below because TorchScript does not support
             # generator expressions.
-            if torch.overrides.has_torch_function(tensor_args):
+            # For the special-casing of pre_dispatch tracing, see https://github.com/pytorch/pytorch/issues/106302
+            is_pre_dispatch_tracing = False
+            if not torch.jit.is_scripting():
+                is_pre_dispatch_tracing = _is_pre_dispatch_tracing()
+            if torch.overrides.has_torch_function(tensor_args) and not is_pre_dispatch_tracing:
                 why_not_fast_path = "some Tensor argument has_torch_function"
             elif not all(_check_arg_device(x) for x in tensor_args):
                 why_not_fast_path = ("some Tensor argument's device is neither one of "
