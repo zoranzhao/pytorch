@@ -3267,11 +3267,19 @@
   dispatch:
     CompositeExplicitAutograd: linspace
 
+- func: linspace.Tensor(Tensor start, Tensor end, int steps, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+  category_override: factory
+  dispatch:
+    CompositeExplicitAutograd: linspace
+
 - func: linspace.out(Scalar start, Scalar end, int steps, *, Tensor(a!) out) -> Tensor(a!)
   dispatch:
     CPU, Meta: linspace_out
     CUDA: linspace_cuda_out
     MPS: linspace_out_mps
+
+- func: linspace.Tensor_out(Tensor start, Tensor end, int steps, *, Tensor(a!) out) -> Tensor(a!)
+  category_override: factory
 
 - func: log(Tensor self) -> Tensor
   device_check: NoCheck   # TensorIterator
@@ -3453,10 +3461,18 @@
   dispatch:
     CompositeExplicitAutograd: logspace
 
+- func: logspace.Tensor(Tensor start, Tensor end, int steps, float base=10.0, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+  category_override: factory
+  dispatch:
+    CompositeExplicitAutograd: logspace
+
 - func: logspace.out(Scalar start, Scalar end, int steps, float base=10.0, *, Tensor(a!) out) -> Tensor(a!)
   dispatch:
     CPU, Meta: logspace_out
     CUDA: logspace_cuda_out
+
+- func: logspace.Tensor_out(Tensor start, Tensor end, int steps, float base=10.0, *, Tensor(a!) out) -> Tensor(a!)
+  category_override: factory
 
 # log_softmax allows positional dtype, unlike most operators, because kwonly is BC-breaking when loading jit models.
 - func: log_softmax.int(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
@@ -7358,6 +7374,7 @@
     CPU: _local_scalar_dense_cpu
     CUDA: _local_scalar_dense_cuda
     MPS: _local_scalar_dense_mps
+    Meta: _local_scalar_dense_meta
   variants: function
 
 # MPS LSTM implementation

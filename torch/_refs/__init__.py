@@ -4524,8 +4524,8 @@ def lerp(start: Tensor, end: Tensor, weight: Union[Tensor, NumberType]):
 @register_decomposition(aten.linspace)
 @out_wrapper()
 def linspace(
-    start: NumberType,
-    end: NumberType,
+    start: Union[NumberType, TensorLikeType],
+    end: Union[NumberType, TensorLikeType],
     steps: NumberType,
     *,
     dtype: Optional[torch.dtype] = None,
@@ -4534,6 +4534,19 @@ def linspace(
     pin_memory: bool = False,
     requires_grad: bool = False,
 ) -> TensorLikeType:
+    if isinstance(start, TensorLikeType):
+        torch._check(
+            start.dim() == 0,
+            lambda: "linspace only supports 0-dimensional start and end tensors",
+        )
+        start = start.item()
+    if isinstance(end, TensorLikeType):
+        torch._check(
+            end.dim() == 0,
+            lambda: "linspace only supports 0-dimensional start and end tensors",
+        )
+        end = end.item()
+
     if py_any(isinstance(arg, complex) for arg in (start, end, steps)):
         default_complex_dtype = utils.corresponding_complex_dtype(
             torch.get_default_dtype()
@@ -4552,7 +4565,8 @@ def linspace(
     # steps does not participate in the computation of the dtype
     torch._check_type(
         isinstance(steps, IntLike),
-        lambda: "steps must be int, not float",
+        lambda: f"received an invalid combination of arguments - got \
+({type(start).__name__}, {type(end).__name__}, {type(steps).__name__})",
     )
     assert isinstance(steps, IntLike)  # for mypy
     torch._check(steps >= 0, lambda: "number of steps must be non-negative")
@@ -4592,14 +4606,15 @@ def linspace(
         start + step * cast_rg(rg),  # type: ignore[arg-type,operator]
         end - step * cast_rg((steps - 1) - rg),  # type: ignore[arg-type,operator]
     )
+
     return _maybe_convert_to_dtype(out, dtype)  # type: ignore[return-value]
 
 
 @register_decomposition(aten.logspace)
 @out_wrapper()
 def logspace(
-    start: NumberType,
-    end: NumberType,
+    start: Union[NumberType, TensorLikeType],
+    end: Union[NumberType, TensorLikeType],
     steps: NumberType,
     base: NumberType = 10,
     *,
@@ -4616,15 +4631,27 @@ def logspace(
     if prims.utils.is_integer_dtype(dtype):
         if isinstance(start, FloatLike):
             start = sym_int(start)
+        elif isinstance(start, TensorLikeType):
+            torch._check(
+                start.dim() == 0,
+                lambda: "logspace only supports 0-dimensional start and end tensors",
+            )
+            start = _maybe_convert_to_dtype(start, dtype)
         if isinstance(end, FloatLike):
             end = sym_int(end)
+        elif isinstance(end, TensorLikeType):
+            torch._check(
+                end.dim() == 0,
+                lambda: "logspace only supports 0-dimensional start and end tensors",
+            )
+            end = _maybe_convert_to_dtype(end, dtype)
 
     assert not isinstance(base, complex)  # for mypy
     if base < 0:
         raise NotImplementedError
-    ret = torch.linspace(
-        start,
-        end,
+    ret = torch.linspace(  # type: ignore[misc]
+        start,  # type: ignore[arg-type]
+        end,  # type: ignore[arg-type]
         steps,  # type: ignore[arg-type]
         dtype=torch.float64,
         layout=layout,
