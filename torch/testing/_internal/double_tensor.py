@@ -1,4 +1,5 @@
 import torch
+from torch.utils._python_dispatch import return_and_correct_aliasing
 
 
 # A simple tensor subclass that holds two tensors internally, and runs every op on both tensors.
@@ -18,7 +19,21 @@ class DoubleTensor(torch.Tensor):
         kwargs["layout"] = a.layout
         kwargs["requires_grad"] = a.requires_grad
         kwargs["dtype"] = a.dtype
-        return torch.Tensor._make_wrapper_subclass(cls, shape, **kwargs)
+        out = torch.Tensor._make_wrapper_subclass(cls, shape, **kwargs)
+
+        # If a and b are non-contiguous (or have weird storage offsets, etc)
+        # Then we want to set the metadata on our wrapper properly too.
+        assert a.shape == b.shape
+        assert a.stride() == b.stride()
+        assert a.storage_offset() == b.storage_offset()
+        if (
+            out.shape != a.shape
+            or out.stride() != a.stride()
+            or out.storage_offset() != a.storage_offset()
+        ):
+            with torch.utils._mode_utils.no_dispatch():
+                out.as_strided_(a.shape, a.stride(), a.storage_offset())
+        return out
 
     def __init__(self, a, b):
         self.a = a
@@ -49,8 +64,14 @@ class DoubleTensor(torch.Tensor):
         out_a = func(*args_a, **kwargs)
         out_b = func(*args_b, **kwargs)
         assert type(out_a) == type(out_b)
+        # TODO: figure out the right way to propagate requires_grad-ness
+        any_requires_grad = any(
+            isinstance(x, torch.Tensor) and x.requires_grad for x in args
+        )
         if isinstance(out_a, torch.Tensor):
-            return DoubleTensor(out_a, out_b)
+            out = DoubleTensor(out_a, out_b)
+            # Use this helper API to ensure that storage aliasing is correct. Needed for torch.compile correctness
+            return return_and_correct_aliasing(func, args, kwargs, out)
         # for aten ops that return non-tensors, just assume that
         # our two inner tensors return the same value
         assert out_a == out_b
