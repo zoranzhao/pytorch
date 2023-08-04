@@ -137,6 +137,9 @@ THPPyInterpreterFrame* THPPyInterpreterFrame_New(_PyInterpreterFrame* frame) {
   } else {                                                              \
   }
 
+// Uncomment next line to print DEBUG_TRACE messages
+// #define TORCHDYNAMO_DEBUG 1
+
 #ifdef TORCHDYNAMO_DEBUG
 
 #define DEBUG_CHECK(cond) CHECK(cond)
@@ -282,6 +285,95 @@ static inline PyObject* call_callback(
   return res;
 }
 
+inline static const char* name(THP_EVAL_API_FRAME_OBJECT* frame) {
+  DEBUG_CHECK(PyUnicode_Check(frame->f_code->co_name));
+  return PyUnicode_AsUTF8(frame->f_code->co_name);
+}
+
+inline static bool is_nn_module_instance(PyObject* obj) {
+  PyObject* torch = PyImport_ImportModule("torch");
+  PyObject* nn = PyObject_GetAttrString(torch, "nn");
+  PyObject* nn_module = PyObject_GetAttrString(nn, "Module");
+  if (PyObject_IsInstance(obj, nn_module)) {
+    Py_DECREF(torch);
+    Py_DECREF(nn);
+    Py_DECREF(nn_module);
+    return true;
+  }
+  Py_DECREF(torch);
+  Py_DECREF(nn);
+  Py_DECREF(nn_module);
+  return false;
+}
+
+
+inline static bool is_dunder_method(THP_EVAL_API_FRAME_OBJECT* frame) {
+  const char* frame_name = name(frame);
+  return sizeof(frame_name) >= 2 && frame_name[0] == '_' && frame_name[1] == '_';
+}
+
+inline static PyObject* get_nn_module_if_frame_is_method_of_nn_module(THP_EVAL_API_FRAME_OBJECT* frame) {
+  // Essentially returns isinstance(f_locals["self"], nn.Module).
+  // There are some caveats here
+  // 1) We rely on name self. It is possible that a method does not use self keyword.
+  // 2) It is possible that a function is incorrectly detected here as nn module
+  // method because the function has a self keyword which happens to be a nn
+  // module instance.
+  // For both of these cases, we will still be functionally correct. Our cache
+  // will still work, just that it might have more collisions than necessary for
+  // the above cases.
+
+  if (is_dunder_method(frame)) {
+    // Skip for dunder methods like __init__ and __getattribute__. The self
+    // object might not be in the full initialized state to do isinstance(self,
+    // nn.Module).
+    return NULL;
+  }
+
+  Py_ssize_t nlocals = frame->f_code->co_nlocals;
+  PyObject* co_varnames = PyCode_GetVarnames(frame->f_code);
+  if (nlocals == 0 || PyTuple_Size(co_varnames) == 0) {
+    return NULL;
+  }
+
+  // Find the index of the first local variable named "self". Because of
+  // continuation on graph breaks, we may have self at non-zero location on the
+  // resumed frames.
+  Py_ssize_t self_index = 0;
+  bool found = false;
+  for (Py_ssize_t i = 0; i < nlocals; i++) {
+    PyObject* first_var = PyTuple_GET_ITEM(co_varnames, i);
+    if (first_var != NULL) {
+      const char* first_var_name = PyUnicode_AsUTF8(first_var);
+      if (strcmp(first_var_name, "self") == 0) {
+        self_index = i;
+        found = true;
+        break;
+      }
+    }
+  }
+
+  if (!found) {
+    return NULL;
+  }
+
+
+  #if IS_PYTHON_3_11_PLUS
+  PyObject** fastlocals = frame->localsplus;
+  #else
+  PyObject** fastlocals = frame->f_localsplus;
+  #endif
+
+  PyObject* self_object = fastlocals[self_index];
+  if (self_object == NULL) {
+    return NULL;
+  }
+  if (is_nn_module_instance(self_object)) {
+    return self_object;
+  }
+  return NULL;
+}
+
 typedef struct cache_entry {
   // check the guards: lambda: <locals of user function>: bool
   PyObject* check_fn;
@@ -294,6 +386,7 @@ typedef struct cache_entry {
 static CacheEntry* create_cache_entry(
     CacheEntry* next,
     PyObject* guarded_code) {
+  // Adds a new entry at the front of the linked list.
   CacheEntry* e = (CacheEntry*)malloc(sizeof(CacheEntry));
   DEBUG_NULL_CHECK(e);
   e->check_fn = PyObject_GetAttrString(guarded_code, "check_fn");
@@ -314,17 +407,156 @@ static void destroy_cache_entry(CacheEntry* e) {
   free(e);
 }
 
-inline static CacheEntry* get_cache_entry(PyCodeObject* code) {
-  CacheEntry* extra = NULL;
+typedef struct {
+  PyObject_HEAD
+  CacheEntry* cache_entry;
+} CacheEntryWrapper;
+
+static PyTypeObject CacheEntryWrapperType = {
+  PyVarObject_HEAD_INIT(NULL, 0)
+  .tp_name = "torch._C.dynamo.eval_frame.CacheEntryWrapper",
+  .tp_basicsize = sizeof(CacheEntryWrapper),
+  .tp_itemsize = 0,
+  .tp_flags = Py_TPFLAGS_DEFAULT,
+  .tp_new = PyType_GenericNew,
+};
+
+
+// The cache lives on the extra segment of code object. It can have one of the 4 possible values
+// 1) NULL - First time accessed the extra segment.
+// 2) SKIP_CODE - We will skip the original frame.
+// 3) CacheEntryWrapper - This contains the cache_entry for the frame.
+// 4) A dict from nn module to the CacheEntryWrapper.
+//
+// Extracting a cache entry is split into two functions -
+// get_cache_entry_without_unwrapping and unwrap_cache_entry. The reason for
+// this split is to enable early return for SKIP_CODE.
+
+// For (1) and (2), we need to short circuit and return quickly for skipped
+// frames. Therefore, we cover this separately in get_cache_entry_without_unwrapping.
+
+// For (3) - If the frame is not a method of a nn.Module instance,
+// we just store the CacheEntry object directly on the extra segment.
+// For (4) - If the frame is a method of a nn.Module instance, we
+// store the CacheEntry for each nn module instance. This ensures that if a
+// SubModule is instantiated multiple times in a nn.Module and there is a
+// graph break in the SubModule, we save the CacheEntry per submodule isntance
+// and not per code object. If it is per code object (which is static and
+// shared across all nn module instances), this leads to collisions.
+
+inline static PyObject* get_cache_entry_without_unwrapping(PyCodeObject* code) {
+  // This just returns the extra value at cache entry index. It does not do any
+  // unwrapping mentioned in (3) and (4). This is useful to check if the frame
+  // has to be skipped and we can return quickly in _custom_eval_frame. This is
+  // useful in cases where we do lots of skips (like pytorch tests).
+   PyObject* extra = NULL;
   _PyCode_GetExtra((PyObject*)code, cache_entry_extra_index, (void*)&extra);
   return extra;
 }
 
-inline static void set_cache_entry(PyCodeObject* code, CacheEntry* extra) {
-  // TODO(jansel): would it be faster to bypass this?
+inline static CacheEntry* get_cache_entry(PyCodeObject* code, PyObject* nn_module) {
+  // The cache lives on the extra segment of code object. It can have one of the 4 possible values
+  // 1) NULL - First time accessed the extra segment.
+  // 2) SKIP_CODE - We will skip the original frame.
+  // 3) CacheEntryWrapper - This contains the cache_entry for the frame.
+  // 4) A dict from nn module to the CacheEntryWrapper.
+  //
+  // More details on (4) - If the frame is a method of a nn.Module instance, we
+  // store the CacheEntry for each nn module instance. This ensures that if a
+  // SubModule is instantiated multiple times in a nn.Module and there is a
+  // graph break in the SubModule, we save the CacheEntry per submodule isntance
+  // and not per code object. If it is per code object (which is static and
+  // shared across all nn module instances), this leads to collisions.
+  //
+  // More details on (3) - If the frame is not a method of a nn.Module instance,
+  // we just store the CacheEntry object directly on the extra segment.
+  //
+  // Note on (2) - We could move SKIP_CODE directly into the
+  // CacheEntryWrapper->cache_entry, but we keep it separate to have a quick
+  // lookup time for frames that are skipped.
+  PyObject* extra = get_cache_entry_without_unwrapping(code);
+  // Case 1 and 2 - Short circuit for SKIP_CODE.
+  // TODO - Does skipping makes it faster?
+  if (extra == NULL || extra == SKIP_CODE) {
+    return (CacheEntry*)extra;
+  }
+
+  // Case 3 - Cache entry is stored directly on the extra segment.
+  if (PyObject_IsInstance(extra, (PyObject *)&CacheEntryWrapperType)) {
+    return ((CacheEntryWrapper*)extra)->cache_entry;
+  }
+
+  // Case 4.
+  DEBUG_CHECK(PyDict_Check(extra));
+  DEBUG_NULL_CHECK(nn_module);
+
+  // TODO - the callback is set to NULL. Currently, there is a callback in
+  // CheckFnManager invalidate, which should track the garbage collection of nn
+  // modules. However, we can't fully rely on that one to call reset_code
+  // because when the callback is called, the referent is dead, so the weakrefs
+  // in the C cache will no longer hold equality with the weakref from python.
+  // Revisit this callback later, when we want to automatically free the cached
+  // guards/graphs on module garbage collection. This involves understanding how
+  // to write a Python callback function purely in C.
+  PyObject* nn_module_weakref = PyWeakref_NewRef(nn_module, NULL);
+
+  // If the cache is empty, return a null object.
+  PyObject* nn_module_to_cache_entry_map = extra;
+  if (PyDict_GetItem(nn_module_to_cache_entry_map, nn_module_weakref) == NULL) {
+    return NULL;
+  }
+
+  // Find the cache entry.
+  CacheEntryWrapper* cache_entry_wrapper = (CacheEntryWrapper*)PyDict_GetItem(nn_module_to_cache_entry_map, nn_module_weakref);
+  return cache_entry_wrapper->cache_entry;
+}
+
+inline static void set_cache_entry_on_code(PyCodeObject* code, CacheEntry* extra) {
   _PyCode_SetExtra((PyObject*)code, cache_entry_extra_index, extra);
 }
 
+inline static void set_cache_entry(PyCodeObject* code, CacheEntry* cache_entry, PyObject* nn_module) {
+  // The cache lives on the extra segment of code object. It can have one of the 4 possible values
+  // 1) NULL - First time accessed the extra segment.
+  // 2) SKIP_CODE - We will skip the original frame.
+  // 3) CacheEntryWrapper - This contains the cache_entry for the frame.
+  // 4) A dict from nn module to the CacheEntryWrapper.
+  // Look in get_cache_entry comments for more details.
+
+  // TODO(jansel): would it be faster to bypass this?
+
+  // Case 1 and 2 - Short circuit for SKIP_CODE.
+  if (cache_entry == NULL || cache_entry == SKIP_CODE) {
+    set_cache_entry_on_code(code, cache_entry);
+    return;
+  }
+  // Case 3
+  if (nn_module == NULL) {
+    CacheEntryWrapper *cache_entry_wrapper = (CacheEntryWrapper*) PyObject_CallObject((PyObject *) &CacheEntryWrapperType, NULL);
+    cache_entry_wrapper->cache_entry = cache_entry;
+    _PyCode_SetExtra((PyObject*)code, cache_entry_extra_index, (PyObject*) cache_entry_wrapper);
+    return;
+  }
+
+  // Case 4
+  PyObject* nn_module_to_cache_entry_map = NULL;
+  _PyCode_GetExtra((PyObject*)code, cache_entry_extra_index, (void*)&nn_module_to_cache_entry_map);
+
+  if (nn_module_to_cache_entry_map == NULL) {
+    nn_module_to_cache_entry_map = PyDict_New();
+  }
+
+  PyObject* nn_module_weakref = PyWeakref_NewRef(nn_module, NULL);
+  // TODO - Do I need to DECREF nn_module here? Is it a stolen reference?
+  CacheEntryWrapper *cache_entry_wrapper = (CacheEntryWrapper*) PyObject_CallObject((PyObject *) &CacheEntryWrapperType, NULL);
+  cache_entry_wrapper->cache_entry = cache_entry;
+  PyDict_SetItem(nn_module_to_cache_entry_map, nn_module_weakref, (PyObject*) cache_entry_wrapper);
+  _PyCode_SetExtra((PyObject*)code, cache_entry_extra_index, nn_module_to_cache_entry_map);
+
+}
+
+// TODO - What is this frame state? Does my change for the nn module cache
+// location requires changing the location of frame states as well.
 inline static PyObject* get_frame_state(PyCodeObject* code) {
   PyObject* extra = NULL;
   _PyCode_GetExtra((PyObject*)code, dynamic_frame_state_extra_index, (void*)&extra);
@@ -336,10 +568,6 @@ inline static void set_frame_state(PyCodeObject* code, PyObject* extra) {
   _PyCode_SetExtra((PyObject*)code, dynamic_frame_state_extra_index, extra);
 }
 
-inline static const char* name(THP_EVAL_API_FRAME_OBJECT* frame) {
-  DEBUG_CHECK(PyUnicode_Check(frame->f_code->co_name));
-  return PyUnicode_AsUTF8(frame->f_code->co_name);
-}
 
 static PyObject* call_guard_fail_hook(
     PyObject* hook,
@@ -375,7 +603,7 @@ static void call_profiler_end_hook(PyObject* record) {
 
 // Return value: borrowed reference
 // Is either Py_None or a PyCodeObject
-static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEntry* prev, size_t index) {
+static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEntry* prev, size_t index, PyObject* maybe_nn_module) {
   if (e == NULL) {
     // NB: intentionally not using Py_RETURN_NONE, to return borrowed ref
     return Py_None;
@@ -401,10 +629,10 @@ static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEn
     // If the hit cache entry is not the head of the linked list,
     // move it to the head
     if (prev != NULL) {
-        CacheEntry* extra = get_cache_entry(frame->f_code);
+        CacheEntry* extra = get_cache_entry(frame->f_code, maybe_nn_module);
         prev->next = e->next;
         e->next = extra;
-        set_cache_entry(frame->f_code, e);
+        set_cache_entry(frame->f_code, e, maybe_nn_module);
     }
     return (PyObject*)e->code;
   }
@@ -415,7 +643,7 @@ static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEn
     }
     Py_DECREF(r);
   }
-  return lookup(e->next, frame, e, index + 1);
+  return lookup(e->next, frame, e, index + 1, maybe_nn_module);
 }
 
 static long cache_size(CacheEntry* e) {
@@ -626,8 +854,8 @@ static PyObject* _custom_eval_frame(
     return eval_frame_default(tstate, frame, throw_flag);
   }
 
-  CacheEntry* extra = get_cache_entry(frame->f_code);
-  if (extra == SKIP_CODE || (callback == Py_False && extra == NULL)) {
+  PyObject* wrapped_extra = get_cache_entry_without_unwrapping(frame->f_code);
+  if (wrapped_extra == SKIP_CODE || (callback == Py_False && wrapped_extra == NULL)) {
     DEBUG_TRACE("skip %s", name(frame));
     return eval_frame_default(tstate, frame, throw_flag);
   }
@@ -640,12 +868,24 @@ static PyObject* _custom_eval_frame(
     return NULL;
   }
 
+  // Get the nn_module object if the frame is a method of a nn.Module instance.
+  // This will be used by get/set_cache_entry and get/set_frame_state.
+  eval_frame_callback_set(Py_None);
+  DEBUG_CHECK(PyDict_CheckExact(frame->f_locals));
+  PyObject* maybe_nn_module = get_nn_module_if_frame_is_method_of_nn_module(frame);
+  CacheEntry* extra = get_cache_entry(frame->f_code, maybe_nn_module);
+  eval_frame_callback_set(callback);
+  if (extra == SKIP_CODE || (callback == Py_False && extra == NULL)) {
+    DEBUG_TRACE("skip %s", name(frame));
+    return eval_frame_default(tstate, frame, throw_flag);
+  }
+
   // A callback of Py_False indicates "run only" mode, the cache is checked, but
   // we never compile.
   if (callback == Py_False) {
     DEBUG_TRACE("In run only mode %s", name(frame));
     PyObject* hook_record = call_profiler_start_hook(guard_profiler_name_str);
-    PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0);
+    PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0, maybe_nn_module);
     call_profiler_end_hook(hook_record);
     Py_XDECREF(hook_record);
 
@@ -671,7 +911,7 @@ static PyObject* _custom_eval_frame(
   eval_frame_callback_set(Py_None);
 
   PyObject* hook_record = call_profiler_start_hook(guard_profiler_name_str);
-  PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0);
+  PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0, maybe_nn_module);
   call_profiler_end_hook(hook_record);
   Py_XDECREF(hook_record);
   if (maybe_cached_code == NULL) {
@@ -710,7 +950,7 @@ static PyObject* _custom_eval_frame(
     DEBUG_TRACE("create cache %s", name(frame));
     extra = create_cache_entry(extra, result);
     Py_DECREF(result);
-    set_cache_entry(frame->f_code, extra);
+    set_cache_entry(frame->f_code, extra, maybe_nn_module);
     // Re-enable custom behavior
     eval_frame_callback_set(callback);
     return eval_custom_code(tstate, frame, extra->code, throw_flag);
@@ -718,7 +958,7 @@ static PyObject* _custom_eval_frame(
     DEBUG_TRACE("create skip %s", name(frame));
     Py_DECREF(result);
     destroy_cache_entry(extra);
-    set_cache_entry(frame->f_code, SKIP_CODE);
+    set_cache_entry(frame->f_code, SKIP_CODE, maybe_nn_module);
     // Re-enable custom behavior
     eval_frame_callback_set(callback);
     return eval_frame_default(tstate, frame, throw_flag);
@@ -786,18 +1026,43 @@ static PyObject* set_eval_frame_py(PyObject* dummy, PyObject* callback) {
   return set_eval_frame(callback, PyThreadState_GET());
 }
 
+
+static void destroy_cache_entry_wrapper(PyObject* code) {
+  PyObject* extra = NULL;
+  _PyCode_GetExtra((PyObject*)code, cache_entry_extra_index, (void*)&extra);
+  if (extra != NULL && extra != SKIP_CODE) {
+    if (PyObject_IsInstance(extra, (PyObject *)&CacheEntryWrapperType)) {
+      CacheEntry* e = ((CacheEntryWrapper*)extra)->cache_entry;
+      destroy_cache_entry(e);
+    } else if (PyDict_Check(extra)) {
+      PyObject* values = PyDict_Values(extra);
+      for (Py_ssize_t i = 0; i < PyList_GET_SIZE(values); i++) {
+        PyObject* value = PyList_GET_ITEM(values, i);
+        if (value != NULL && PyObject_IsInstance(value, (PyObject *)&CacheEntryWrapperType)) {
+          CacheEntry* e = ((CacheEntryWrapper*)value)->cache_entry;
+          destroy_cache_entry(e);
+        }
+      }
+    }
+  }
+  set_cache_entry_on_code((PyCodeObject*)code, NULL);
+}
+
+
+static void destroy_frame_state(PyObject* code) {
+  PyObject* frame_state = get_frame_state((PyCodeObject*)code);
+  Py_XDECREF(frame_state);
+  set_frame_state((PyCodeObject*)code, NULL);
+}
+
 static PyObject* reset_code(PyObject* dummy, PyObject* code) {
   if (!PyCode_Check(code)) {
     DEBUG_TRACE0("arg error");
     PyErr_SetString(PyExc_TypeError, "expected a code object");
     return NULL;
   }
-
-  destroy_cache_entry(get_cache_entry((PyCodeObject*)code));
-  PyObject* frame_state = get_frame_state((PyCodeObject*)code);
-  Py_XDECREF(frame_state);
-  set_cache_entry((PyCodeObject*)code, NULL);
-  set_frame_state((PyCodeObject*)code, NULL);
+  destroy_cache_entry_wrapper(code);
+  destroy_frame_state(code);
   Py_RETURN_NONE;
 }
 
@@ -817,7 +1082,7 @@ static PyObject* skip_code(PyObject* dummy, PyObject* obj) {
     PyErr_SetString(PyExc_TypeError, "expected a code object");
     return NULL;
   }
-  set_cache_entry((PyCodeObject*)obj, SKIP_CODE);
+  set_cache_entry_on_code((PyCodeObject*)obj, SKIP_CODE);
   Py_RETURN_NONE;
 }
 
@@ -916,6 +1181,15 @@ PyObject* torch_c_dynamo_eval_frame_init(void) {
     return NULL;
   }
 #endif
+
+  if (PyType_Ready(&CacheEntryWrapperType) < 0) {
+    return NULL;
+  }
+  Py_INCREF(&CacheEntryWrapperType);
+  if (PyModule_AddObject(module, "_CacheEntryPyWrapper", (PyObject *) &CacheEntryWrapperType) < 0) {
+      Py_DECREF(&CacheEntryWrapperType);
+      return NULL;
+  }
 
   return module;
 }
