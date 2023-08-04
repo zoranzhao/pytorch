@@ -1100,7 +1100,8 @@ class NNModuleTests(torch._dynamo.test_case.TestCase):
         out4 = [opt_m4(i), opt_m4(i), opt_m4(i)]
         self.assertTrue(torch._dynamo.testing.same(out2, out3))
         self.assertTrue(torch._dynamo.testing.same(out2, out4))
-        self.assertEqual(cnt.frame_count, 3)
+        # total frame count is 6 because 3 per module
+        self.assertEqual(cnt.frame_count, 6)
 
     @patch.object(torch._dynamo.config, "raise_on_ctx_manager_usage", False)
     def test_generation_tag(self):
@@ -2112,6 +2113,49 @@ class OptimizedModuleTest(torch._dynamo.test_case.TestCase):
         foo(Mod2(), torch.rand([4]))
         # causes two compilations, bc unimplemented custom setattr
         self.assertTrue(compiles_without_buffers >= 2)
+
+    def test_cache_size_limit_on_module_graph_break(self):
+        size = (10, 10)
+        cache_size_limit = 2
+        num_of_submodule = cache_size_limit * 2
+
+        class SubModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(*size)
+
+            def helper(self, x):
+                # The first part of the graph is not recompiled because self is not used
+                # in the first part. But, second part is recompiled for each instance of
+                # SubModule.
+                a = torch.sin(torch.cos(x))
+                torch._dynamo.graph_break()
+                return self.linear(a)
+
+            def forward(self, x):
+                return self.helper(x)
+
+        class MockModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mods = [SubModule() for _ in range(num_of_submodule)]
+
+            def forward(self, x):
+                for mod in self.mods:
+                    x = mod(x)
+                return x
+
+        mod = MockModule()
+        with unittest.mock.patch(
+            "torch._dynamo.config.error_on_recompile", True
+        ), unittest.mock.patch(
+            "torch._dynamo.config.cache_size_limit", cache_size_limit
+        ):
+            cnts = torch._dynamo.testing.CompileCounterWithBackend("eager")
+            opt_mod = torch.compile(mod, backend=cnts)
+            x = torch.randn(*size)
+            opt_mod(x)
+            self.assertEqual(cnts.frame_count, 2 * num_of_submodule)
 
 
 if torch.distributed.is_available():

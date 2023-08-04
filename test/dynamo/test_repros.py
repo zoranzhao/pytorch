@@ -1119,10 +1119,12 @@ class ReproTests(torch._dynamo.test_case.TestCase):
         for _ in range(10):
             self.assertTrue(same(opt_model(a, b, c, d), correct))
 
+        # The model makes a deepcopy of nn module, so each one is cache
+        # separately.
         if torch._dynamo.config.assume_static_by_default:
-            self.assertExpectedInline(cnt.frame_count, """2""")
+            self.assertExpectedInline(cnt.frame_count, """11""")
         else:
-            self.assertExpectedInline(cnt.frame_count, """3""")
+            self.assertExpectedInline(cnt.frame_count, """12""")
 
     def test_hf_model_output(self):
         ex = ModelOutput(a=torch.randn(10), b=torch.randn(10), c=torch.randn(10))
