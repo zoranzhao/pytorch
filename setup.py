@@ -1099,7 +1099,8 @@ def main():
         "jinja2",
         "fsspec",
     ]
-
+    if IS_WINDOWS:
+        install_requires.append("mkl==2021.4.0")
     extras_require = {"opt-einsum": ["opt-einsum>=3.3"]}
     if platform.system() == "Linux":
         cmake_cache_vars = get_cmake_cache_vars()
