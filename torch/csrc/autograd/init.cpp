@@ -952,6 +952,17 @@ static PyObject* set_proxy_tensor_mode(PyObject* _unused, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
+static PyObject* set_functional_tensor_mode(PyObject* _unused, PyObject* arg) {
+  HANDLE_TH_ERRORS
+  if (arg != Py_None) {
+    Py_INCREF(arg);
+    c10::impl::TorchDispatchModeTLS::set_functional_mode(
+        std::make_shared<c10::SafePyObject>(arg, getPyInterpreter()));
+  }
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
 static PyObject* unset_fake_tensor_mode(PyObject* _unused, PyObject* _unused2) {
   HANDLE_TH_ERRORS
   const auto& mode = c10::impl::TorchDispatchModeTLS::unset_fake_mode();
@@ -966,6 +977,17 @@ static PyObject* unset_proxy_tensor_mode(
     PyObject* _unused2) {
   HANDLE_TH_ERRORS
   const auto& mode = c10::impl::TorchDispatchModeTLS::unset_proxy_mode();
+  auto* r = mode->ptr(getPyInterpreter());
+  Py_INCREF(r);
+  return r;
+  END_HANDLE_TH_ERRORS
+}
+
+static PyObject* unset_functional_tensor_mode(
+    PyObject* _unused,
+    PyObject* _unused2) {
+  HANDLE_TH_ERRORS
+  const auto& mode = c10::impl::TorchDispatchModeTLS::unset_functional_mode();
   auto* r = mode->ptr(getPyInterpreter());
   Py_INCREF(r);
   return r;
@@ -987,6 +1009,20 @@ static PyObject* get_fake_tensor_mode(PyObject* _unused, PyObject* _unused2) {
 static PyObject* get_proxy_tensor_mode(PyObject* _unused, PyObject* _unused2) {
   HANDLE_TH_ERRORS
   const auto& mode = c10::impl::TorchDispatchModeTLS::get_proxy_mode();
+  if (mode != c10::nullopt) {
+    auto* r = (*mode)->ptr(getPyInterpreter());
+    Py_INCREF(r);
+    return r;
+  }
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+static PyObject* get_functional_tensor_mode(
+    PyObject* _unused,
+    PyObject* _unused2) {
+  HANDLE_TH_ERRORS
+  const auto& mode = c10::impl::TorchDispatchModeTLS::get_functional_mode();
   if (mode != c10::nullopt) {
     auto* r = (*mode)->ptr(getPyInterpreter());
     Py_INCREF(r);
@@ -1147,6 +1183,18 @@ static PyMethodDef methods[] = { // NOLINT
     {"_set_fake_tensor_mode", set_fake_tensor_mode, METH_O, nullptr},
     {"_unset_fake_tensor_mode", unset_fake_tensor_mode, METH_NOARGS, nullptr},
     {"_get_fake_tensor_mode", get_fake_tensor_mode, METH_NOARGS, nullptr},
+    {"_set_functional_tensor_mode",
+     set_functional_tensor_mode,
+     METH_O,
+     nullptr},
+    {"_unset_functional_tensor_mode",
+     unset_functional_tensor_mode,
+     METH_NOARGS,
+     nullptr},
+    {"_get_functional_tensor_mode",
+     get_functional_tensor_mode,
+     METH_NOARGS,
+     nullptr},
     {"_push_on_torch_dispatch_stack",
      push_on_torch_dispatch_stack,
      METH_O,
