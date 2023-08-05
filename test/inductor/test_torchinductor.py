@@ -70,10 +70,8 @@ importlib.import_module("functorch")
 importlib.import_module("filelock")
 
 from torch._inductor import config, test_operators
-
 from torch._inductor.compile_fx import compile_fx, compile_fx_inner
 from torch._inductor.utils import has_torchvision_roi_align
-
 from torch.testing._internal.common_utils import slowTest
 from torch.testing._internal.inductor_utils import HAS_CPU, HAS_CUDA
 
@@ -705,6 +703,47 @@ class CommonTemplate:
         self.common(fn, (torch.randn(10),))
         self.assertEqual(torch._inductor.metrics.ir_nodes_pre_fusion, 2)
 
+    def test_outer_reduction_fuses(self):
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            x = x.sin()
+            x = test_operators.realize(x)
+            return x.mean(dim=0)
+
+        x = torch.randn(128, 128, device=self.device)
+        result, (code,) = run_and_get_code(fn, x)
+        self.assertEqual(result, x.sin().mean(dim=0))
+        if self.device != "cpu":
+            self.assertEqual(code.count("@triton.jit"), 1)
+
+    def test_reshape_fusion(self):
+        def fn(x, y):
+            x = x + y
+            x = test_operators.realize(x)
+            s0, s1, s2, s3, s4 = x.size()
+            x = x.permute(1, 0, 4, 3, 2).reshape(s0 * s1, s2 * s3 * s4)
+            return x
+
+        x = torch.randn(9, 8, 7, 6, 5, device=self.device)
+        y = torch.randn(9, 8, 7, 6, 5, device=self.device)
+        result, (code,) = run_and_get_code(torch.compile(fn, fullgraph=True), x, y)
+        self.assertEqual(result, fn(x, y))
+        if self.device != "cpu":
+            self.assertEqual(code.count("@triton.jit"), 1)
+
+    def test_cat_avg_pool(self):
+        def forward(relu_40, relu_43):
+            cat_5 = aten.cat.default([relu_40, relu_43], 1)
+            return aten.avg_pool2d.default(cat_5, [3, 3], [1, 1], [1, 1])
+
+        self.common(
+            forward,
+            [
+                torch.randn(8, 192, 17, 17),
+                torch.randn(8, 192, 17, 17),
+            ],
+        )
+
     def test_scheduler_vertical_fusion1(self):
         realize = test_operators.realize
 
@@ -729,10 +768,7 @@ class CommonTemplate:
             ),
         )
         self.assertEqual(torch._inductor.metrics.ir_nodes_pre_fusion, 5)
-        self.assertEqual(
-            torch._inductor.metrics.generated_kernel_count,
-            1 if self.device == "cuda" else 3,
-        )
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
     def test_index_propagation(self):
         def flip(x):
@@ -2784,7 +2820,6 @@ class CommonTemplate:
             (torch.randn([1, 2, 4, 8]),),
         )
 
-    @config.patch(pick_loop_orders=True)
     def test_transposed_propagates(self):
         @torch._dynamo.optimize("inductor", nopython=True)
         def fn(x, y):

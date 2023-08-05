@@ -3,6 +3,8 @@ import dataclasses
 import functools
 import itertools
 import logging
+import math
+import operator
 import os
 import pprint
 import textwrap
@@ -16,8 +18,10 @@ from torch._dynamo.utils import dynamo_timed
 from . import config, dependencies, ir, metrics
 from .codegen.common import get_scheduling_for_device
 from .dependencies import StarDep, WeakDep
+from .codegen.common import index_prevent_reordering
+from .dependencies import extract_read_writes, StarDep, WeakDep
 from .sizevars import SimplifyIndexing
-from .utils import cache_on_self, cmp, free_symbol_has, has_triton
+from .utils import cache_on_self, cmp, has_triton, sympy_subs
 from .virtualized import V
 
 log = logging.getLogger(__name__)
@@ -133,8 +137,14 @@ class BaseSchedulerNode:
     def get_mutations(self):
         return self.node.get_mutation_names()
 
+    def has_aliasing(self):
+        return bool(self.get_aliases())
+
+    def has_mutation(self):
+        return bool(self.get_mutations())
+
     def has_aliasing_or_mutation(self):
-        return bool(self.get_aliases() or self.get_mutations())
+        return self.has_aliasing() or self.has_mutation()
 
     def set_read_writes(self, rw: dependencies.ReadWrites):
         self.read_writes: dependencies.ReadWrites = rw
@@ -228,6 +238,15 @@ class BaseSchedulerNode:
     def is_foreach(self):
         return False
 
+    @cache_on_self
+    def numel_hint(self):
+        r1, r2 = self.get_ranges()
+        return functools.reduce(
+            operator.mul,
+            (*V.graph.sizevars.size_hints(r1), *V.graph.sizevars.size_hints(r2)),
+            1,
+        )
+
     def can_inplace(self, read_dep: dependencies.MemoryDep):
         return False
 
@@ -238,21 +257,12 @@ class BaseSchedulerNode:
         if not self.node.should_allocate():
             return
 
-        if isinstance(self, (SchedulerNode,)) and (
-            self.node.get_alias_names() or self.node.get_mutation_names()
-        ):
+        if self.has_aliasing_or_mutation():
             V.graph.wrapper_code.codegen_allocation(self.node)
             return
 
         if (
-            (
-                isinstance(self, (SchedulerNode,))
-                # o what have i done.  lets make this an api
-                or (
-                    isinstance(self, ExternKernelSchedulerNode)
-                    and isinstance(self.node, (ir.AllReduce, ir.InPlaceHint))
-                )
-            )
+            (isinstance(self, SchedulerNode) or self.is_inplace_hint())
             and config.inplace_buffers
             and (
                 not isinstance(V.kernel, torch._inductor.codegen.triton.TritonKernel)
@@ -262,6 +272,8 @@ class BaseSchedulerNode:
             from .codegen.wrapper import buffer_reuse_key
 
             ordered_reads = sorted(self.read_writes.reads, key=lambda x: x.name)
+            writes = {dep.name: dep for dep in self.read_writes.writes}
+            read_counts = collections.Counter(dep.name for dep in ordered_reads)
 
             for read in ordered_reads:
                 input_node: BaseSchedulerNode = self.scheduler.name_to_node.get(
@@ -288,6 +300,14 @@ class BaseSchedulerNode:
                         )
                         and buffer_reuse_key(input_node.node)
                         == buffer_reuse_key(self.node)
+                        and (
+                            self.is_inplace_hint()
+                            or (
+                                read_counts[read.name] == 1
+                                and self.get_name() in writes
+                                and read.index == writes[self.get_name()].index
+                            )
+                        )
                     ):
                         V.graph.wrapper_code.codegen_inplace_reuse(
                             input_node.node, self.node
@@ -318,6 +338,9 @@ class BaseSchedulerNode:
             if isinstance(use.node, OutputNode):
                 return False
         return True
+
+    def is_inplace_hint(self):
+        return False
 
     def codegen_originating_info(self, buffer, only_once=True):
         if not config.comment_origin:
@@ -360,6 +383,9 @@ class BaseSchedulerNode:
         buffer.writelines(out_lines)
         self.written = True
 
+    def prepare_for_codegen(self):
+        pass
+
 
 class ExternKernelSchedulerNode(BaseSchedulerNode):
     def debug_str_extra(self):
@@ -380,9 +406,7 @@ class ExternKernelSchedulerNode(BaseSchedulerNode):
             # (would this have been fixed if I tracked mutations properly above?)
             return False
 
-        if not isinstance(
-            self.node, (torch._inductor.ir.AllReduce, torch._inductor.ir.InPlaceHint)
-        ):
+        if not self.is_inplace_hint():
             # TODO make this a property of the IR
             return False
 
@@ -392,9 +416,121 @@ class ExternKernelSchedulerNode(BaseSchedulerNode):
 
         return False
 
+    def is_inplace_hint(self):
+        return isinstance(self.node, (ir.AllReduce, ir.InPlaceHint))
+
 
 class NopKernelSchedulerNode(BaseSchedulerNode):
     pass
+
+
+@dataclasses.dataclass
+class LoopOrder:
+    @classmethod
+    def permute(cls, node, body, sizes, order, priority=0):
+        if list(order) == list(range(len(order))):
+            return cls(
+                node,
+                body,
+                sizes,
+                priority=priority,
+            )
+
+        iter_size, reduce_size = sizes
+        iter_size = [iter_size[i] for i in order]
+        assert len(order) == len(iter_size)
+        inverse_order = {b: a for a, b in enumerate(order)}
+        inverse_order = [inverse_order[i] for i in range(len(order))]
+
+        def wrapped(*indices):
+            index = list(itertools.chain(*indices))
+            assert len(index) == len(iter_size) + len(reduce_size)
+            iter_idx = index[: len(iter_size)]
+            reduce_idx = index[len(iter_size) :]
+            iter_idx = [iter_idx[i] for i in inverse_order]
+            return body(iter_idx, reduce_idx)
+
+        return cls(
+            node,
+            wrapped,
+            (iter_size, reduce_size),
+            permute_order=order,
+            priority=priority,
+        )
+
+    def __init__(
+        self, node, body, sizes, read_writes=None, permute_order=None, priority=0
+    ):
+        self.node = node
+        self.body = body
+        self.sizes = sizes
+        if read_writes is None:
+            read_writes = dependencies.extract_read_writes(body, *sizes, normalize=True)
+        self.read_writes = read_writes
+        self.permute_order = permute_order
+        self.priority = priority
+
+    def __str__(self):
+        return textwrap.dedent(
+            f"""
+            LoopOrder(
+                node = {self.node}
+                sizes = {self.sizes}
+                permute_order = {self.permute_order}
+                read_writes = {self.read_writes}
+            )
+        """
+        ).strip()
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
+
+    def has_contiguous(self):
+        for dep in itertools.chain(
+            self.read_writes.reads,
+            self.read_writes.writes,
+        ):
+            if dep.is_contiguous():
+                return True
+        return False
+
+    @cache_on_self
+    def pointwise_read_writes(self):
+        """
+        Get the memory dependencies in the non-reduction axis.
+        """
+        sizes, reduction_sizes = self.sizes
+
+        def fn(index):
+            return self.body(index, [sympy.Integer(0) for _ in reduction_sizes])
+
+        return dependencies.extract_read_writes(fn, sizes)
+
+    def get_ranges(self):
+        return self.sizes
+
+    @property
+    def group(self):
+        return self.node.group
+
+    def is_reduction(self):
+        return self.node.is_reduction()
+
+
+def _all_swaps(original_order):
+    """
+    Yield permutations of original_order with a single swap applied
+    """
+    n = len(original_order)
+    yield original_order
+    for i in range(n):
+        for j in range(i + 1, n):
+            order = list(original_order)
+            order[i], order[j] = order[j], order[i]
+            yield tuple(order)
 
 
 class SchedulerNode(BaseSchedulerNode):
@@ -403,18 +539,99 @@ class SchedulerNode(BaseSchedulerNode):
         (
             self._sizes,
             self._body,
-        ) = node.simplify_and_reorder()
-
-        self.group = (node.get_device(), group_fn(self._sizes))
+        ) = node.get_sizes_and_body()
 
         if self.is_template():
-            self.set_read_writes(node.normalized_read_writes())
+            self.set_read_writes(
+                node.normalized_read_writes().generalize_for_scheduling(
+                    self.has_mutation()
+                )
+            )
         else:
             self.set_read_writes(
                 dependencies.extract_read_writes(
-                    self._body, *self._sizes, normalize=True
-                )
+                    self._body,
+                    *self._sizes,
+                ).generalize_for_scheduling(self.has_mutation())
             )
+
+        self.group = (node.get_device(), group_fn(self._sizes))
+        self._vars = None
+
+    def default_loop_order(self):
+        """
+        This mimics the older loop order heuristics from
+        apply_loop_reordering.  In theory, we could entirely replace this
+        with the newer algorithm in select_loop_orders(), but this is
+        needed for performance.
+        """
+        (index_vars, reduction_vars), _ = dependencies.index_vars_squeeze(*self._sizes)
+        indexing = [
+            sympy_subs(
+                # drop the reduction part
+                r.index,
+                {v: sympy.Integer(0) for v in reduction_vars if v != 0},
+            )
+            for r in extract_read_writes(self._body, *self._sizes).reads_and_writes()
+        ]
+        stride_lengths = [
+            V.graph.sizevars.stride_hints(expr, index_vars) for expr in indexing
+        ]
+        return tuple(reversed(pick_loop_order(stride_lengths, self._sizes[0])))
+
+    @cache_on_self
+    def possible_loop_orders(self):
+        if self.is_template():
+            return [
+                LoopOrder(
+                    self, self._body, self._sizes, self.node.normalized_read_writes()
+                )
+            ]
+
+        default_order = self.default_loop_order()
+        choices = [
+            LoopOrder.permute(self, self._body, self._sizes, default_order, priority=1)
+        ]
+        if (
+            not config.pick_loop_orders
+            or config.loop_ordering_search_limit <= 1
+            or
+            # TODO(jansel): this workarounds reordering CPU reductions leading
+            # to some subtle bugs in vectorization, see test_transpose_sum_outer
+            (self.get_device().type == "cpu" and self.is_reduction())
+        ):
+            return choices
+
+        def visit(order):
+            assert isinstance(order, tuple)
+            if order not in tried and len(choices) < config.loop_ordering_search_limit:
+                choices.append(LoopOrder.permute(self, self._body, self._sizes, order))
+                tried.add(order)
+
+        iter_sizes, reduce_sizes = self._sizes
+        n = len(iter_sizes)
+        tried = {default_order}
+        if len(iter_sizes) >= 2:
+            visit((1, *range(2, n), 0))
+        if len(iter_sizes) >= 3:
+            visit((0, *range(2, n), 1))
+
+        if math.factorial(n) <= config.loop_ordering_search_limit:
+            # for small n use all n! permutations
+            find_choices = itertools.permutations
+        else:
+            # prune search space to n^2
+            find_choices = _all_swaps
+
+        for order in find_choices(tuple(range(n))):
+            visit(order)
+            if len(choices) >= config.loop_ordering_search_limit:
+                break
+        return choices
+
+    def active_loop_orders(self):
+        """Return loop orders that remain valid after fusions"""
+        return [{self: x} for x in self.possible_loop_orders()]
 
     def debug_str_extra(self):
         name = self.get_name()
@@ -482,12 +699,62 @@ class SchedulerNode(BaseSchedulerNode):
         return dependencies.extract_read_writes(fn, sizes)
 
     def can_inplace(self, read_dep: dependencies.MemoryDep):
-        if self.get_aliases() or self.is_template():
-            return False
-        if len(self.read_writes.writes) == 1 and hasattr(read_dep, "index"):
-            write_dep = next(iter(self.read_writes.writes))
-            return read_dep.index == write_dep.index and read_dep.size == write_dep.size
-        return False
+        return not (self.has_aliasing_or_mutation() or self.is_template())
+
+    def apply_loop_order(self, ordering: LoopOrder):
+        if self.is_template():
+            return
+
+        (iter_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
+            *ordering.sizes, prefix="y"
+        )
+        body = ir.LoopBody(ordering.body, (iter_vars, reduce_vars), var_ranges)
+
+        self.read_writes = ordering.read_writes
+        self._vars = iter_vars, reduce_vars
+        self._sizes = ordering.sizes
+        self._body = body
+
+    def merge_loops(self):
+        if self.is_template():
+            return
+        assert self._vars, "must call apply_loop_order() first"
+        (iter_size, reduce_size) = self._sizes
+        index_formulas = [*self._body.indexing_exprs.values()]
+        iter_vars, reduce_vars = self._vars
+
+        def merge_dims(x_vars, x_size):
+            size, reindex, prune = V.graph.sizevars._simplify_loops(
+                x_vars,
+                x_size,
+                index_prevent_reordering(index_formulas, x_vars, x_size),
+            )
+            return size, reindex
+
+        iter_ranges, iter_reindex = merge_dims(iter_vars, iter_size)
+        reduce_ranges, reduce_reindex = merge_dims(reduce_vars, reduce_size)
+
+        # retrace the loop body with simplification applied
+        (iter_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
+            iter_ranges, reduce_ranges, prefix="z"
+        )
+        body = ir.LoopBody(
+            self._body,
+            [iter_reindex(iter_vars), reduce_reindex(reduce_vars)],
+            var_ranges,
+        )
+
+        self._vars = None
+        self._sizes = (iter_ranges, reduce_ranges)
+        self._body = body
+
+    def prepare_for_codegen(self):
+        self.apply_loop_order(FusedSchedulerNode.select_loop_orders((self,))[0][self])
+        self.merge_loops()
+
+
+class FusionFailed(Exception):
+    pass
 
 
 class FusedSchedulerNode(BaseSchedulerNode):
@@ -497,15 +764,119 @@ class FusedSchedulerNode(BaseSchedulerNode):
     its unmet dependencies as the union of its constituent nodes.
     """
 
+    @staticmethod
+    @functools.lru_cache(1024)
+    def select_loop_orders(snodes: List[SchedulerNode]):
+        def is_valid(ordering: Dict[SchedulerNode, LoopOrder]):
+            if len(ordering) <= 1:
+                return True
+            writes = dict()
+            for order in ordering.values():
+                for dep in order.read_writes.reads:
+                    if dep.name in writes and not dep.can_read_from(writes[dep.name]):
+                        if len(debug_reasons) < 1:
+                            debug_reasons.append(f"{dep}!={writes[dep.name]}")
+                        return False
+                for dep in order.read_writes.writes:
+                    assert dep.name not in writes
+                    writes[dep.name] = dep
+            return True
+
+        def score(ordering: Dict[SchedulerNode, LoopOrder]):
+            reuse_score = 0
+            priority = 0
+            combined = set()
+            internal_deps = set()
+            external_reads = set()
+            external_writes = set()
+            for node, order in ordering.items():
+                priority += order.priority
+                union = set(order.read_writes.reads_and_writes())
+                reuse_score += len(combined & union)
+                combined.update(union)
+
+                for dep in order.read_writes.reads:
+                    if dep.name in all_node_names or dep.numel_hint() != numel_hint:
+                        internal_deps.add(dep)
+                    else:
+                        external_reads.add(dep)
+
+                for dep in order.read_writes.writes:
+                    if (
+                        all(u.get_name() in all_node_names for u in (node.users or ()))
+                        or dep.numel_hint() != numel_hint
+                    ):
+                        internal_deps.add(dep)
+                    else:
+                        external_writes.add(dep)
+
+            return (
+                # TODO(jansel): this heuristic has not been well tuned
+                reuse_score,
+                priority,
+                sum(map(score_dep, external_writes | external_reads)),
+                sum(map(score_dep, internal_deps)),
+            )
+
+        def score_dep(dep: dependencies.MemoryDep):
+            if (
+                isinstance(dep, dependencies.StarDep)
+                or dep.is_indirect()
+                or dep.is_scalar()
+            ):
+                # TODO(jansel): include indirect?
+                return 0
+            strides = V.graph.sizevars.stride_hints(dep.index, dep.var_names)
+            sizes = V.graph.sizevars.size_hints(dep.size)
+            assert len(strides) == len(sizes)
+            expected = 1
+            for size, stride in zip(reversed(sizes), reversed(strides)):
+                if stride != expected:
+                    if expected <= 32:
+                        return -10
+                    return -1
+                expected = stride * size
+            return 0
+
+        all_node_names = functools.reduce(set.union, (n.get_names() for n in snodes))
+        numel_hint = max(n.numel_hint() for n in snodes)
+        orderings: List[Dict[SchedulerNode, LoopOrder]] = [dict()]
+        backend = snodes[0].scheduler.get_backend(snodes[0].get_device())
+        for node in snodes:
+            debug_reasons = []
+            new_orderings = []
+            for base in orderings:
+                for choice in node.active_loop_orders():
+                    ordering = dict(base)
+                    ordering.update(choice)
+                    assert len(ordering) == len(base) + len(choice)
+                    if is_valid(ordering) and backend.is_loop_order_valid(
+                        ordering.values()
+                    ):
+                        new_orderings.append(ordering)
+            if not new_orderings:
+                raise FusionFailed(" | ".join(debug_reasons))
+            new_orderings.sort(key=score, reverse=True)
+            orderings = new_orderings[: config.loop_ordering_search_limit]
+
+        return orderings
+
     @classmethod
     def fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode):
         assert node1.scheduler is node2.scheduler
-        return cls(node1.scheduler, node1.get_nodes() + node2.get_nodes())
+        loop_orders = cls.select_loop_orders((node1, node2))
+        return cls(node1.scheduler, node1.get_nodes() + node2.get_nodes(), loop_orders)
 
-    def __init__(self, scheduler: "Scheduler", snodes: List[SchedulerNode]):
+    def __init__(
+        self,
+        scheduler: "Scheduler",
+        snodes: List[SchedulerNode],
+        loop_orders: List[Dict[SchedulerNode, LoopOrder]],
+    ):
         # NB: No need to call super().__init__() because we don't need to re-use any of its logic.
         self.snodes = snodes
         self.scheduler = scheduler
+        self.loop_orders = loop_orders
         self.node = None  # type: ignore[assignment]
         self.users = None
         self.inverse_users = []
@@ -525,6 +896,22 @@ class FusedSchedulerNode(BaseSchedulerNode):
         } - self.read_writes.writes
         self.min_order = min([x.min_order for x in self.snodes])
         self.max_order = max([x.max_order for x in self.snodes])
+
+    def active_loop_orders(self):
+        """Return loop orders that remain valid after fusions"""
+        return self.loop_orders
+
+    def prepare_for_codegen(self):
+        for node, ordering in self.loop_orders[0].items():
+            node.apply_loop_order(ordering)
+
+        # TODO(jansel): merging loops causes issues on CPU, which requires
+        # every node to have its loops merged in the exact same way.  To
+        # fix this we need to pool all the indexing from the entire fusion
+        # and run merge loops on that.
+        if ir.is_triton(self.get_device()):
+            for node in self.get_nodes():
+                node.merge_loops()
 
     @cache_on_self
     def get_name(self) -> str:
@@ -584,8 +971,12 @@ class FusedSchedulerNode(BaseSchedulerNode):
         return self.group[0]
 
     @cache_on_self
-    def has_aliasing_or_mutation(self):
-        return any(x.has_aliasing_or_mutation() for x in self.snodes)
+    def has_aliasing(self):
+        return any(x.has_aliasing() for x in self.snodes)
+
+    @cache_on_self
+    def has_mutation(self):
+        return any(x.has_mutation() for x in self.snodes)
 
     @cache_on_self
     def op_counts(self):
@@ -593,6 +984,10 @@ class FusedSchedulerNode(BaseSchedulerNode):
         for node in self.snodes:
             op_counts.update(node.op_counts())
         return op_counts
+
+    @cache_on_self
+    def numel_hint(self):
+        return max(x.numel_hint() for x in self.snodes)
 
     # None of these need to be implemented, as a FusedSchedulerNode is just an
     # abstraction for scheduling purposes
@@ -713,7 +1108,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
         self.name_to_node = {}
 
         if prev_node_1 is None or prev_node_2 is None:
-            super().__init__(scheduler, nodes)
+            super().__init__(scheduler, nodes, None)
 
             for node in nodes:
                 for read in node.read_writes.reads:
@@ -780,6 +1175,10 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
     def get_first_name(self):
         return self.snodes[0].get_first_name()
 
+    def prepare_for_codegen(self):
+        for node in self.snodes:
+            node.prepare_for_codegen()
+
 
 def pick_loop_order(stride_lengths, sizes, priority_idx=()):
     """
@@ -824,6 +1223,7 @@ def pick_loop_order(stride_lengths, sizes, priority_idx=()):
 @dataclasses.dataclass
 class NodeUser:
     node: BaseSchedulerNode
+    # TODO(jansel): refactor can_inplace to be generated dynamically not stored
     can_inplace: bool = False
 
     def get_name(self):
@@ -1108,6 +1508,7 @@ class Scheduler:
             self.fuse_nodes_once()
             if len(self.nodes) == old_len:
                 break
+        FusedSchedulerNode.select_loop_orders.cache_clear()
 
     def fuse_nodes_once(self):
         """
@@ -1292,13 +1693,19 @@ class Scheduler:
 
         if node1.get_names() & node2.recursive_predecessors:
             # node2 depends on node1 outputs
-            if not self.can_fuse_vertical(node1, node2):
-                return False
-            return self.get_backend(device).can_fuse_vertical(node1, node2)
+            return (
+                self.can_fuse_vertical(node1, node2)
+                and self.can_fuse_loop_orders(node1, node2)
+                and self.get_backend(device).can_fuse_vertical(node1, node2)
+            )
+        elif node1.is_foreach() and node2.is_foreach():
+            return False
         else:  # nodes don't depend on each other, but may have common reads
-            if self.can_fusion_increase_peak_memory(node1, node2):
-                return False
-            return self.get_backend(device).can_fuse_horizontal(node1, node2)
+            return (
+                not self.can_fusion_increase_peak_memory(node1, node2)
+                and self.can_fuse_loop_orders(node1, node2)
+                and self.get_backend(device).can_fuse_horizontal(node1, node2)
+            )
 
     def can_fuse_vertical(self, node1, node2):
         """
@@ -1312,21 +1719,8 @@ class Scheduler:
         computed_deps = set()
 
         for rd in node2.unmet_dependencies:
-            for cd in node1.read_writes.writes:
-                # StarDep doesn't match MemoryDep, different indices don't match
-                # However, broadcasting sometimes strips dimensions, and if that's the case
-                # we still can match unmet dep
-                # if there's indirect indexing, don't match it
-                if (
-                    rd.name == cd.name
-                    and type(rd) == type(cd)
-                    and not free_symbol_has(rd.index, "tmp")
-                    and not free_symbol_has(cd.index, "tmp")
-                    and rd.index == cd.index
-                    and len(rd.size) >= len(cd.size)
-                    and rd.size[: len(cd.size)] == cd.size
-                ):
-                    computed_deps.add(rd)
+            if rd in node1.read_writes.writes and rd.can_read_from(rd):
+                computed_deps.add(rd)
 
         remaining_deps = {dep.name for dep in node2.unmet_dependencies - computed_deps}
         if remaining_deps & node1_names:
@@ -1338,6 +1732,28 @@ class Scheduler:
         for name in remaining_deps:
             if node1_names & self.name_to_fused_node[name].recursive_predecessors:
                 return False
+        return True
+
+    def can_fuse_loop_orders(self, node1, node2):
+        """
+        Check if the loop ordering algorithm can find a loop order that
+        works for both node1 and node2.
+        """
+        if node1.is_foreach() and node2.is_foreach():
+            return len(node1.get_nodes()) == len(node2.get_nodes()) and all(
+                self.can_fuse_loop_orders(a, b)
+                for a, b in zip(node1.get_nodes(), node2.get_nodes())
+            )
+        elif node1.is_foreach():
+            return all(self.can_fuse_loop_orders(a, node2) for a in node1.get_nodes())
+        elif node2.is_foreach():
+            return all(self.can_fuse_loop_orders(node1, b) for b in node2.get_nodes())
+
+        try:
+            FusedSchedulerNode.select_loop_orders((node1, node2))
+        except FusionFailed as e:
+            log.debug("FusionFailed: %s", e)
+            return False
         return True
 
     def score_fusion(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode):
@@ -1434,9 +1850,10 @@ class Scheduler:
                 buf = V.kernel.args.inplace_buffers[name]
                 if buf == "REMOVED":
                     continue
-                remove = all(n in names_to_remove for n in buf.other_names)
-                if remove:
-                    self.remove_inplace_buffer(name)
+                if buf != "REMOVED":
+                    remove = all(n in names_to_remove for n in buf.other_names)
+                    if remove:
+                        self.remove_inplace_buffer(name)
                 V.graph.inplaced_to_remove.add(name)
             else:
                 self.remove_buffer(name)
@@ -1509,6 +1926,7 @@ class Scheduler:
     @dynamo_timed
     def codegen(self):
         for node in self.nodes:
+            node.prepare_for_codegen()
             self.enter_context(node)
             self.buffer_names_no_longer_needed.update(node.last_usage)
 
@@ -1551,6 +1969,7 @@ class Scheduler:
             self.available_buffer_names.update(node.get_names())
 
         self.flush()
+        FusedSchedulerNode.select_loop_orders.cache_clear()
 
 
 class BaseScheduling:

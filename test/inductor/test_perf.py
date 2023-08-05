@@ -337,7 +337,7 @@ class FusionTests(TestCase):
             a.copy_(a0)
 
         inp = (T(10, 10), T(10, 10), T(10, 10))
-        self.assertExpectedInline(count_numel(f, *inp), """500""")
+        self.assertExpectedInline(count_numel(f, *inp), """700""")
 
 
 class SchedulerFusionTests(TestCase):

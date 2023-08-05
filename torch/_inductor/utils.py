@@ -416,6 +416,8 @@ def sympy_subs(expr: sympy.Expr, replacements: Dict[Any, Any]) -> sympy.Expr:
     """
     xreplace is faster than subs, but is way more picky
     """
+    if not replacements:
+        return expr
 
     def promote_strings(key):
         if isinstance(key, str):
@@ -744,7 +746,7 @@ def override_lowering(aten_op, override_fn):
         lowering.lowerings[aten_op] = orig_fn
 
 
-def add_scheduler_init_hook(pre_fn, post_fn=None):
+def add_scheduler_init_hook(pre_fn=None, post_fn=None):
     """
     Add hook functions to be called at the beginning and end of Scheduler.__init__.
     Used for unit tests.
@@ -754,7 +756,8 @@ def add_scheduler_init_hook(pre_fn, post_fn=None):
     orig_fn = Scheduler.__init__
 
     def wrapper(scheduler, nodes):
-        pre_fn(scheduler, nodes)
+        if pre_fn:
+            pre_fn(scheduler, nodes)
         out = orig_fn(scheduler, nodes)
         if post_fn:
             post_fn(scheduler, nodes)
