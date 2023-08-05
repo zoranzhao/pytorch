@@ -412,8 +412,19 @@ def _compile(
             mutated_closure_cell_contents,
             frame_state=frame_state,
         )
-        with tracing(tracer.output.tracing_context):
-            tracer.run()
+
+        try:
+            with tracing(tracer.output.tracing_context):
+                tracer.run()
+        except Exception:
+            if config.translation_validation:
+                fakes = tracer.output.tracked_fakes
+                tracer.output.shape_env.produce_guards(
+                    [a.fake for a in fakes],
+                    [a.source for a in fakes],
+                )
+            raise
+
         output = tracer.output
         assert output is not None
         assert output.output_instructions
