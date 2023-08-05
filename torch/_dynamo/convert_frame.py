@@ -218,6 +218,13 @@ def exception_handler(e, code, frame=None, export=False):
 FRAME_COUNTER = 0
 
 
+def is_recompilation(code, cache_size):
+    # code in input_code is not sufficient. For nn module instance methods, we
+    # have per module instance cache, so we need to check the cache size as
+    # well.
+    return code in input_codes and cache_size >= 1
+
+
 def convert_frame_assert(
     compiler_fn: CompilerFn,
     one_graph: bool = True,
@@ -238,7 +245,7 @@ def convert_frame_assert(
 
         code = frame.f_code
 
-        if code in input_codes and (
+        if is_recompilation(code, cache_size) and (
             recompiles_log.isEnabledFor(logging.DEBUG) or config.error_on_recompile
         ):
             if is_guard_failure_reporting_enabled():
@@ -492,7 +499,9 @@ def _compile(
             hooks.guard_fail_fn if hooks else None,
         )
 
-        guarded_code = GuardedCode(out_code, check_fn.check_fn)
+        guarded_code = GuardedCode(
+            out_code, check_fn.check_fn, output.guarded_nn_module_var_index
+        )
 
         if guards_log.isEnabledFor(logging.DEBUG):
             guard_str = "GUARDS:\n"
@@ -515,6 +524,7 @@ def _compile(
             hooks.guard_export_fn(output.guards)
 
         output.local_scope.clear()
+        # print("--->", guarded_code, flush=True)
         return guarded_code
     except (
         Unsupported,
