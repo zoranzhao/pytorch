@@ -270,11 +270,15 @@ class TestDispatcher(common_utils.TestCase):
         custom_domain = onnxscript.values.Opset(domain="custom", version=1)
 
         @onnxscript.script(custom_domain)
-        def test_custom_op(x: TCustomFloat, y: TCustomFloat) -> TCustomFloat:
+        def test_custom_op(
+            x: TCustomFloat, y: TCustomFloat, alpha: int = 1
+        ) -> TCustomFloat:
             return op.Add(x, y)
 
         @onnxscript.script(custom_domain)
-        def test_default_op(x: TCustomFloat, y: TCustomFloat) -> TCustomFloat:
+        def test_default_op(
+            x: TCustomFloat, y: TCustomFloat, alpha: int = 1
+        ) -> TCustomFloat:
             return op.Add(x, y)
 
         op_full_name = "test::test_op"
@@ -330,15 +334,21 @@ class TestDispatcher(common_utils.TestCase):
         custom_domain = onnxscript.values.Opset(domain="custom", version=1)
 
         @onnxscript.script(custom_domain)
-        def test_second_custom_op(x: TCustomFloat, y: TCustomFloat) -> TCustomFloat:
+        def test_second_custom_op(
+            x: TCustomFloat, y: TCustomFloat, alpha: int = 1
+        ) -> TCustomFloat:
             return op.Add(x, y)
 
         @onnxscript.script(custom_domain)
-        def test_third_custom_op(x: TCustomFloat, y: TCustomFloat) -> TCustomFloat:
+        def test_third_custom_op(
+            x: TCustomFloat, y: TCustomFloat, alpha: int = 1
+        ) -> TCustomFloat:
             return op.Add(x, y)
 
         @onnxscript.script(custom_domain)
-        def test_first_custom_op(x: TCustomFloat, y: TCustomFloat) -> TCustomFloat:
+        def test_first_custom_op(
+            x: TCustomFloat, y: TCustomFloat, alpha: int = 1
+        ) -> TCustomFloat:
             return op.Add(x, y)
 
         op_full_name = "aten::add"
@@ -457,24 +467,6 @@ class TestOpSchemaWrapper(common_utils.TestCase):
             common_utils.subtest(
                 ([torch.randn(3, 4), torch.tensor(3)], {}, ops.core.aten_new_full, 2),
                 name="match_2_inputs",
-            ),
-            common_utils.subtest(
-                (
-                    [torch.randn(3, 4), torch.tensor(3)],
-                    {"dtype": 2},  # at this point, dtype should be converted to int
-                    ops.core.aten_new_full,
-                    1,
-                ),
-                name="match_2_inputs_and_mismatch_1_kwarg",
-            ),
-            common_utils.subtest(
-                (
-                    [torch.randn(3, 4), torch.tensor(3)],
-                    {},
-                    ops.core.aten_new_full_dtype,
-                    1,
-                ),
-                name="match_2_input_and_mismatch_1_kwargs_optional",
             ),
             common_utils.subtest(
                 (
