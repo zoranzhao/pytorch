@@ -1,10 +1,12 @@
-import json
-import xgboost
 import pickle
+import argparse
 import numpy as np
 from sklearn.model_selection import GroupShuffleSplit
 
-raw_data_file = "../../raw_data.pkl"
+parser = argparse.ArgumentParser()
+parser.add_argument("--raw_data", type=str, default="../../raw_data.pkl")
+
+raw_data_file = parser.parse_args().raw_data
 with open(raw_data_file, "rb") as file:
     raw_data = pickle.load(file)
 

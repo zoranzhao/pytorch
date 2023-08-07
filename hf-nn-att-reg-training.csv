@@ -1,0 +1,8 @@
+dev,name,batch_size,speedup,abs_latency,compilation_latency,compression_ratio,eager_peak_mem,dynamo_peak_mem,calls_captured,unique_graphs,graph_breaks,unique_graph_breaks
+cuda,AlbertForMaskedLM,4,1.751051,153.282730,32.526469,1.896552,16.500774,8.700405,441,1,7,6
+cuda,AlbertForQuestionAnswering,4,1.769489,150.535334,31.101380,2.078346,16.262966,7.824954,441,1,7,6
+cuda,AllenaiLongformerBase,0,0.000000,0.000000,0,0,0,0,0,0,0,0
+cuda,BartForCausalLM,4,1.570016,69.697686,53.769545,0.906863,11.902728,13.125169,479,17,15,11
+cuda,BartForConditionalGeneration,2,1.508723,89.147683,115.170170,0.953589,15.597001,16.356105,1248,31,27,11
+cuda,BertForMaskedLM,16,1.733022,63.487561,42.604088,1.379928,11.645857,8.439464,374,4,10,7
+cuda,BertForQuestionAnswering,16,2.022329,47.076388,40.291671,1.978392,8.846633,4.471628,381,4,10,7

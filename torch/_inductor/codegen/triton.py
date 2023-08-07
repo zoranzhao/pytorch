@@ -15,6 +15,7 @@ import sympy
 import torch
 
 import torch._logging
+from torch import nn
 from torch._prims_common import is_integer_dtype
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from ..._dynamo.utils import counters
@@ -2306,15 +2307,85 @@ def get_heuristic_configs(autotuner_dict):
     raise ValueError(f"Unknown heuristics {heuristics}")
 
 
+class NN(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.kernel_category_embedding = torch.nn.Embedding(
+            num_embeddings=3, embedding_dim=32
+        )
+        self.num_of_loops_embedding = torch.nn.Embedding(
+            num_embeddings=10, embedding_dim=32
+        )
+
+        self.hidden_dim = [
+            32 + 32 + 8 * 56 + (323 - 2 - 56),
+            8192,
+            4096,
+            2048,
+            1024,
+            512,
+            256,
+            128,
+            64,
+            32,
+            1,
+        ]
+        self.num_layers = len(self.hidden_dim) - 1
+
+        # self.op_bag_ln = nn.Linear(55, 32)
+        self.op_bag_ln = nn.ModuleList([nn.Linear(1, 8) for i in range(56)])
+
+        self.layers = nn.ModuleList(
+            [
+                nn.Linear(self.hidden_dim[i], self.hidden_dim[i + 1])
+                for i in range(self.num_layers)
+            ]
+        )
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(self.hidden_dim[i + 1]) for i in range(self.num_layers - 1)]
+        )
+
+        torch.nn.init.xavier_normal_(self.kernel_category_embedding.weight)
+        torch.nn.init.xavier_normal_(self.num_of_loops_embedding.weight)
+        for layer in list(self.op_bag_ln) + list(self.layers):
+            torch.nn.init.xavier_normal_(layer.weight)
+            torch.nn.init.zeros_(layer.bias)
+
+    def forward(self, x):
+        x = torch.cat(
+            [
+                self.kernel_category_embedding(x[:, 0].long()),
+                self.num_of_loops_embedding(x[:, 1].long()),
+                torch.cat(
+                    [self.op_bag_ln[i](x[:, 2 + i].unsqueeze(1)) for i in range(56)],
+                    dim=1,
+                ),
+                x[:, 58:],
+            ],
+            dim=1,
+        )
+        for norm, layer in zip(self.norms, self.layers[:-1]):
+            x = torch.nn.functional.leaky_relu(norm(layer(x)))
+        x = torch.sigmoid(self.layers[-1](x))
+        return x
+
+
 @functools.lru_cache(None)
-def load_model():
+def load_model(use_NN=False):
     log.debug(f"loading model, pid {os.getpid()}")
-    ranker = xgboost.XGBRegressor()
-    ranker.load_model(
-        "/scratch/bohanhou/fresh/experiments/xgb_baseline/model_normalize_runtime_all_cpu.bin"
-    )
-    # ranker = xgboost.XGBRanker()
-    # ranker.load_model("/scratch/bohanhou/fresh/experiments/xgb_maxatt/model_cpu.bin")
+    if not use_NN:
+        ranker = xgboost.XGBRegressor()
+        ranker.load_model(
+            "/scratch/bohanhou/fresh/experiments/xgb_baseline/model_normalize_runtime_all_cpu.bin"
+        )
+    else:
+        ranker = NN().to("cuda")
+        ranker.load_state_dict(
+            torch.load(
+                "/scratch/bohanhou/fresh/experiments/nn_1/nn.0.007179192898166753.0.04731562372526994.pt"
+            )
+        )
     return ranker
 
 
@@ -2338,32 +2409,71 @@ def autotuner_predict(autotuner_dict):
         if no_R:
             tconfig.kwargs.pop("RBLOCK", None)
 
+    use_NN = True
     X = get_feature_vec(src, configs, autotuner_dict)
-    ranker = load_model()
-    indices = np.argsort(ranker.predict(X))[::-1]
-    sorted_configs = [configs[i] for i in indices]
-    best_config = sorted_configs[0]
-    candidates = SearchSpaceGenerator(size_hints).generate(best_config)
-    X = get_feature_vec(src, candidates, autotuner_dict)
-    indices = np.argsort(ranker.predict(X))[::-1]
-    sorted_candidates = [candidates[i] for i in indices]
-    # print(
-    #     autotuner_dict["file_name"],
-    #     "\n",
-    #     best_config,
-    #     ">>>",
-    #     [(cfg.kwargs, cfg.num_warps) for cfg in sorted_candidates],
-    # )
-    return sorted_candidates[:2]
+    ranker = load_model(use_NN)
+    if use_NN:
+        X = X.astype(np.float32)
+        X[:, 58:60] = np.log2(X[:, 58:60] + 1)
+        X[:, 315] = np.log2(X[:, 315] + 1)
+        X[:, 316] = np.log2(X[:, 316] + 1)
+        X[:, 317] = np.log2(X[:, 317] + 1)
+        X[:, 320] = np.log2(X[:, 320] + 1)
+        X[:, 321] = np.log2(X[:, 321] + 1)
+        X[:, 322] = np.log2(X[:, 322] + 1)
 
-    # X = get_feature_vec(src, configs, autotuner_dict)
-    # ranker = load_model()
-    # indices = np.argsort(ranker.predict(X))
+        for i in range(10):
+            base = 60 + i * 17
+            X[:, base + 1] = np.log2(X[:, base + 1] + 1)
+            X[:, base + 2 : base + 8] = np.log2(
+                np.abs(X[:, base + 2 : base + 8]) + 1
+            ) * np.sign(X[:, base + 2 : base + 8])
+            X[:, base + 8 : base + 14] = np.log2(
+                np.abs(X[:, base + 8 : base + 14]) + 1
+            ) * np.sign(X[:, base + 8 : base + 14])
+
+        for i in range(5):
+            base = 230 + i * 17
+            X[:, base + 1] = np.log2(X[:, base + 1] + 1)
+            X[:, base + 2 : base + 8] = np.log2(
+                np.abs(X[:, base + 2 : base + 8]) + 1
+            ) * np.sign(X[:, base + 2 : base + 8])
+            X[:, base + 8 : base + 14] = np.log2(
+                np.abs(X[:, base + 8 : base + 14]) + 1
+            ) * np.sign(X[:, base + 8 : base + 14])
+
+    # indices = np.argsort(ranker.predict(X))[::-1]
     # sorted_configs = [configs[i] for i in indices]
-    # # if len(sorted_configs) >= 2:
-    # #     return sorted_configs[:2]
-    # # else:
-    # return sorted_configs[:1]
+    # best_config = sorted_configs[0]
+    # candidates = SearchSpaceGenerator(size_hints).generate(best_config)
+    # X = get_feature_vec(src, candidates, autotuner_dict)
+    # indices = np.argsort(ranker.predict(X))[::-1]
+    # sorted_candidates = [candidates[i] for i in indices]
+    # # print(
+    # #     autotuner_dict["file_name"],
+    # #     "\n",
+    # #     best_config,
+    # #     ">>>",
+    # #     [(cfg.kwargs, cfg.num_warps) for cfg in sorted_candidates],
+    # # )
+    # return sorted_candidates[:2]
+
+    if use_NN:
+        ranker.eval()
+        indices = np.argsort(
+            ranker.forward(torch.from_numpy(X).to("cuda"))
+            .detach()
+            .cpu()
+            .numpy()
+            .squeeze()
+        )[::-1]
+    else:
+        indices = np.argsort(ranker.predict(X))[::-1]
+    sorted_configs = [configs[i] for i in indices]
+    # if len(sorted_configs) >= 2:
+    #     return sorted_configs[:2]
+    # else:
+    return sorted_configs[:1]
 
 
 def get_reads_writes(cur_scheduler, node):
