@@ -4591,6 +4591,12 @@ try:
         )
         return list(map(TensorBox.create, result))
 
+    @register_lowering(c10d_functional.all_to_all_single)
+    def all_to_all_single(self, output_split_sizes, input_split_sizes, tag, ranks, group_size):
+        return TensorBox.create(ir.AllToAllSingle.create(
+            self, output_split_sizes, input_split_sizes, tag, ranks, group_size
+        ))
+
 except ImportError:
     log.info(
         "Inductor support for distributed collectives depends on building torch.distributed"

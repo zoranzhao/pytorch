@@ -328,6 +328,27 @@ class TestTraceableCollectives(MultiThreadedTestCase):
         self.assertEqual(torch.tensor([4], device=device), res[0])
         self.assertEqual(torch.tensor([8], device=device), res[1])
 
+    @parametrize("device", ["cuda"])
+    def test_all_to_all_single(self, device):
+        if device == "cuda":
+            if torch.cuda.device_count() < self.world_size:
+                self.skipTest("Not enough CUDA devices")
+            torch.cuda.set_device(dist.get_rank())
+        mesh = dt.DeviceMesh(device, torch.arange(self.world_size))
+        rank = dist.get_rank()
+
+        row = self.world_size * (rank + 1) * (self.world_size + 1) / 2
+        x = torch.ones(int(row), 5, device=device) * (rank + 1)
+        split_sizes = [(i + 1) * (rank + 1) for i in range(self.world_size)]
+        y = ft_c.all_to_all_single(
+            x, output_split_sizes=split_sizes, input_split_sizes=split_sizes, group=mesh
+        )
+        expected = []
+        for idx, tensor in enumerate(torch.split(x, split_sizes)):
+            expected.append(torch.full_like(tensor, (idx + 1)))
+        expected = torch.cat(expected)
+        self.assertEqual(y, expected)
+
 
 class TestMetaCollectives(TestCase):
     def test_all_reduce(self):

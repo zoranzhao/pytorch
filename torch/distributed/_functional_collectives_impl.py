@@ -263,3 +263,26 @@ def _reduce_scatter_tensor_coalesced_fallback(output_tensors, input_tensors, op,
         work = c10d.reduce_scatter_tensor(out_tensor, shard, op=op, group=group, async_op=async_op)
         work_list.append(work)
     return work_list
+
+
+def _all_to_all_single(
+    input: torch.Tensor,
+    output_split_sizes: List[int],
+    input_split_sizes: List[int],
+    tag: str,
+    ranks: List[int],
+    group_size: int,
+):
+    group = c10d._find_or_create_pg_by_ranks_and_tag(tag, ranks, group_size)
+
+    out_size = list(input.size())
+    out_size[0] = sum(output_split_sizes)
+    out_tensor = input.new_empty(out_size)
+
+    work = c10d.all_to_all_single(
+        out_tensor, input, output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes, group=group, async_op=True
+    )
+    _register_tensor_work(out_tensor, work)
+
+    return out_tensor

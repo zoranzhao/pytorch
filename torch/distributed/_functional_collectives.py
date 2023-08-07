@@ -291,6 +291,32 @@ def reduce_scatter_tensor_coalesced(
     return list(map(_maybe_wrap_tensor, tensor_list))
 
 
+def all_to_all_single(
+    self: torch.Tensor,
+    output_split_sizes: List[int],
+    input_split_sizes: List[int],
+    group: RANK_TYPES,
+    tag: str = "",
+) -> torch.Tensor:
+    """
+    Each process splits input tensor and then scatters the split list
+    to all processes in a group. Then concatenate the received tensors from all
+    the processes in the group and return single output tensor.
+
+    Group can be one of:
+        List[int]: ranks participating in the collective.
+        List[List[int]]: 2D mesh of ranks taking part of this collective in MPMD.
+        ProcessGroup: Will perform a collective using the ranks and tag of the PG.
+        DeviceMesh: Do a SPMD collective over all ranks of the mesh
+        (DeviceMesh, int): Do a MPMD collective over one dimension of the DeviceMesh
+
+    :: N.B. If you pass a PG or a 1D list to perform a MPMD collective, the compiler won't be able to recover
+    that information and perform collective algebraic optimization. Use other forms of input for that.
+    """
+    tag, rankset, group_size = _expand_group(group, tag)
+    tensor = torch.ops.c10d_functional.all_to_all_single(self, output_split_sizes, input_split_sizes, tag, rankset, group_size)  # type: ignore[attr-defined]
+    return _maybe_wrap_tensor(tensor)
+
 
 class AsyncCollectiveTensor(torch.Tensor):
     r"""
@@ -458,7 +484,6 @@ def _reduce_scatter_tensor_meta(input, reduce_op, tag, rankset, group_size):
 def _all_reduce_coalesced_meta(self, reduceOp, tag, rankset, group_size):
     return [torch.empty_like(t) for t in self]
 
-
 def _reduce_scatter_tensor_coalesced_meta(inputs, reduceOp, tag, rankset, group_size):
     def mk_out_tensor(input):
         out_size = list(input.size())
@@ -467,6 +492,11 @@ def _reduce_scatter_tensor_coalesced_meta(inputs, reduceOp, tag, rankset, group_
         return out_tensor
 
     return [mk_out_tensor(t) for t in inputs]
+
+def _all_to_all_single_meta(input, output_split_sizes, input_split_sizes, tag, rankset, group_size):
+    out_size = list(input.size())
+    out_size[0] = sum(output_split_sizes)
+    return input.new_empty(out_size)
 
 
 def _register_ops():
@@ -478,6 +508,7 @@ def _register_ops():
         "all_gather_into_tensor_coalesced(Tensor[] input, str tag, int[] ranks, int group_size) -> Tensor[]",
         "reduce_scatter_tensor(Tensor input, str reduceOp, str tag, int[] ranks, int group_size) -> Tensor",
         "reduce_scatter_tensor_coalesced(Tensor[] inputs, str reduceOp, str tag, int[] ranks, int group_size) -> Tensor[]",
+        "all_to_all_single(Tensor input, int[] output_split_sizes, int[] input_split_sizes, str tag, int[] ranks, int group_size) -> Tensor",
     ]
 
     my_module = sys.modules[__name__]

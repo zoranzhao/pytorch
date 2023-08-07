@@ -214,6 +214,41 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             inductor_out = compiled_fn(*inputs)
             self.assertTrue(same(eager_out, inductor_out, tol=0.001))
 
+    @unittest.skipIf(not has_triton(), "Inductor+gpu needs triton and recent GPU arch")
+    @skip_if_lt_x_gpu(2)
+    # TODO: somehow inductor bg compile threads are causing hangs at exit with distributed work dtor
+    @patch.object(torch._inductor.config, "compile_threads", 1)
+    def test_all_to_all_single_inductor(self):
+        def example(inp, *, tag, ranks, group_size):
+            split_sizes = [(i + 1) * (self.rank + 1) for i in range(self.world_size)]
+            a2a = torch.ops.c10d_functional.all_to_all_single(
+                inp,
+                output_split_sizes=split_sizes,
+                input_split_sizes=split_sizes,
+                tag=tag,
+                ranks=ranks,
+                group_size=group_size,
+            )
+            a2a = torch.ops.c10d_functional.wait_tensor(a2a)
+            return a2a
+
+        def compile(func, example_inputs):
+            graph = make_fx(func)(*example_inputs)
+            return inductor_compile_fx(graph, example_inputs)
+
+        with _dynamo_dist_per_rank_init(self.rank, self.world_size):
+            example = functools.partial(
+                example,
+                **self.get_world_trs(),
+            )
+            row = self.world_size * (self.rank + 1) * (self.world_size + 1) / 2
+            inputs = (torch.ones(int(row), 5, device="cuda") * (self.rank + 1),)
+
+            eager_out = example(*inputs)
+            compiled_fn = compile(example, inputs)
+            inductor_out = compiled_fn(*inputs)
+            self.assertTrue(same(eager_out, inductor_out, tol=0.001))
+
 
 @requires_nccl()
 class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
