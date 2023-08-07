@@ -1,4 +1,5 @@
 import logging
+import collections
 from collections import Counter
 from typing import Set
 
@@ -126,7 +127,7 @@ def constant_fold_uniform_value(gm):
 
     # Got failures in `test_is_set_to_cuda` if we change aliasing on constants,
     # so just constant-ify if a Tensor is unaliased
-    constant_data_ptrs = Counter()
+    constant_data_ptrs: collections.Counter = Counter()
 
     for constant in node_replacements.values():
         if (
