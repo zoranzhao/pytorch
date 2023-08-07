@@ -187,6 +187,7 @@ include_patterns = [
     'torch/_inductor/graph.py',
     'torch/_inductor/codegen/wrapper.py',
     'torch/_inductor/cudagraph_trees.py',
+    'torch/_inductor/compile_fx.py',
     'torch/_inductor/lowering.py',
     'torch/_inductor/metrics.py',
     'torch/_C/_dynamo/**/*.py',
