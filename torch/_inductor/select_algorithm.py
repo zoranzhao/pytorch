@@ -8,7 +8,7 @@ import textwrap
 import time
 from io import StringIO
 
-from typing import Any, List
+from typing import Any, Dict, List
 from unittest.mock import patch
 
 import sympy
@@ -383,7 +383,7 @@ def _jinja2_env():
 
 class TritonTemplate:
     index_counter = itertools.count()
-    all_templates = dict()
+    all_templates: Dict[str, "TritonTemplate"] = dict()
 
     @staticmethod
     def _template_from_string(source):
@@ -887,7 +887,7 @@ class AlgorithmSelectorCache(PersistentCache):
             lines += ["]", f"out = {tensor_repr(out)}", ""]
             return "\n".join(lines)
 
-        benchmark.debug_str = debug_str
+        setattr(benchmark, "debug_str", debug_str) # noqa: B010
         return benchmark
 
     @staticmethod
